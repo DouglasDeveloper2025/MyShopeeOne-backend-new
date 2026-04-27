@@ -5,3 +5,11 @@
 /logs
 /arquivos
 .env
+/scratch
+*scratch/*
+
+.zip
+.rar
+.db
+/*.zip
+*.db
