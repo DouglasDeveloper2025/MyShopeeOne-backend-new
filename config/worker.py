@@ -1,7 +1,8 @@
 import os
 import sys
 from redis import Redis
-from rq import SimpleWorker # Importamos SimpleWorker para Windows
+from rq import Worker, SimpleWorker
+import platform
 
 # Adiciona o diretório raiz do backend ao path para encontrar o app.py
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -14,9 +15,16 @@ listen = ['shopee_tasks']
 def start_worker():
     # O worker precisa do contexto do Flask para interagir com o banco de dados
     with app.app_context():
-        print("--- RQ SimpleWorker Iniciado (Modo Windows) ---")
-        # No Windows, usamos SimpleWorker para evitar o erro de 'os.fork'
-        worker = SimpleWorker(listen, connection=redis_conn)
+        # Detectar SO
+        is_windows = platform.system() == "Windows"
+        
+        if is_windows:
+            print("--- RQ SimpleWorker Iniciado (Modo Windows) ---")
+            worker = SimpleWorker(listen, connection=redis_conn)
+        else:
+            print("--- RQ Worker Iniciado (Modo Linux/Produção) ---")
+            worker = Worker(listen, connection=redis_conn)
+            
         worker.work()
 
 if __name__ == '__main__':

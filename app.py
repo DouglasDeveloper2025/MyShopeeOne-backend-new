@@ -16,7 +16,11 @@ CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
 # Configuração do Banco de Dados postgresql
-app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get("DATABASE_URL")
+database_url = os.environ.get("DATABASE_URL")
+if database_url and database_url.startswith("postgres://"):
+    database_url = database_url.replace("postgres://", "postgresql://", 1)
+
+app.config["SQLALCHEMY_DATABASE_URI"] = database_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = os.environ.get(
     "SQLALCHEMY_TRACK_MODIFICATIONS", False
 )
@@ -69,11 +73,10 @@ def background_checker():
             time.sleep(60)
 
 
+# Inicia a thread de checagem (necessário mover para fora do if __main__ para rodar no Gunicorn)
+import threading
+checker_thread = threading.Thread(target=background_checker, daemon=True)
+checker_thread.start()
+
 if __name__ == "__main__":
-    import threading
-
-    # Inicia a thread em modo daemon para que ela morra com o processo principal
-    checker_thread = threading.Thread(target=background_checker, daemon=True)
-    checker_thread.start()
-
     socketio.run(app, host="0.0.0.0", port=5005, debug=True)
