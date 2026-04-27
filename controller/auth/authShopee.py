@@ -4,8 +4,11 @@ import time
 import requests
 import os
 from datetime import datetime, timedelta
+import pytz
 from urllib.parse import quote
 from model.shopeeModel import db, IntegracaoShopee
+
+tz_br = pytz.timezone("America/Sao_Paulo")
 
 
 class TokenShopee:
@@ -101,7 +104,7 @@ class TokenShopee:
                 integracao.shop_id = str(shop_id)
                 integracao.status = "Ativo"
                 integracao.expire_in = data.get("expire_in", 14400)
-                integracao.last_access_update_at = datetime.now()
+                integracao.last_access_update_at = datetime.now(tz_br).replace(tzinfo=None)
                 db.session.commit()
                 return {"status": "sucesso"}
 
@@ -110,7 +113,7 @@ class TokenShopee:
             # e tiver sido atualizada recentemente (últimos 60 segundos), consideramos sucesso.
             # Isso evita erros em chamadas duplicadas do frontend.
             if data.get("error") == "invalid_code" and integracao.status == "Ativo":
-                if integracao.last_access_update_at and (datetime.now() - integracao.last_access_update_at) < timedelta(seconds=60):
+                if integracao.last_access_update_at and (datetime.now(tz_br).replace(tzinfo=None) - integracao.last_access_update_at) < timedelta(seconds=60):
                     return {"status": "sucesso"}
 
             return {"status": "erro", "detalhes": data}
@@ -135,7 +138,8 @@ class TokenShopee:
             return None, "A integração com a Shopee não foi encontrada. Configure suas chaves no painel de configurações."
 
         if integracao.last_access_token and integracao.last_access_update_at:
-            if (datetime.now() - integracao.last_access_update_at) < timedelta(
+            agora_br = datetime.now(tz_br).replace(tzinfo=None)
+            if (agora_br - integracao.last_access_update_at) < timedelta(
                 hours=3, minutes=50
             ):
                 return {
@@ -177,7 +181,7 @@ class TokenShopee:
                 integracao.last_access_token = resp["access_token"]
                 integracao.refresh_token = resp["refresh_token"]
                 integracao.expire_in = resp.get("expire_in", 14400)
-                integracao.last_access_update_at = datetime.now()
+                integracao.last_access_update_at = datetime.now(tz_br).replace(tzinfo=None)
                 db.session.commit()
                 return {
                     "access_token": integracao.last_access_token,
