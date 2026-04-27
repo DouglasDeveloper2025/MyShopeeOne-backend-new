@@ -1,6 +1,12 @@
+import eventlet
+eventlet.monkey_patch()
+
 import os
 import sys
-from redis import Redis
+from dotenv import load_dotenv
+
+# Carrega variáveis de ambiente
+load_dotenv()
 from rq import Worker, SimpleWorker
 import platform
 
