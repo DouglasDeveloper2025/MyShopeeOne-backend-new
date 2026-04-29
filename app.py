@@ -103,11 +103,9 @@ def background_checker():
             time.sleep(60)
 
 
-# Inicia a thread de checagem (necessário mover para fora do if __main__ para rodar no Gunicorn)
-import threading
-
-checker_thread = threading.Thread(target=background_checker, daemon=True)
-checker_thread.start()
+# Inicia a checagem em segundo plano de forma assíncrona compatível com eventlet
+eventlet.spawn(background_checker)
 
 if __name__ == "__main__":
-    socketio.run(app, host="0.0.0.0", port=5005, debug=True)
+    port = int(os.environ.get("PORT", 5005))
+    socketio.run(app, host="0.0.0.0", port=port, debug=True)
