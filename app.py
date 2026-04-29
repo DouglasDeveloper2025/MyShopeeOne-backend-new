@@ -1,8 +1,12 @@
-import eventlet
-
-eventlet.monkey_patch()
-
 import os
+import sys
+
+# Somente aplica o monkey_patch se NÃO estiver rodando o worker do RQ.
+# Isso evita conflitos com o multiprocessing do Python 3.14 no Render.
+if "worker.py" not in sys.argv[0]:
+    import eventlet
+    eventlet.monkey_patch()
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from model.shopeeModel import db
@@ -104,7 +108,10 @@ def background_checker():
 
 
 # Inicia a checagem em segundo plano de forma assíncrona compatível com eventlet
-eventlet.spawn(background_checker)
+# Somente se o eventlet foi carregado (não é worker)
+if "worker.py" not in sys.argv[0]:
+    import eventlet
+    eventlet.spawn(background_checker)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5005))
