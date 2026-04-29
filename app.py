@@ -1,4 +1,5 @@
 import eventlet
+
 eventlet.monkey_patch()
 
 import os
@@ -51,33 +52,60 @@ def background_checker():
 
     tz_br = pytz.timezone("America/Sao_Paulo")
 
-    print("--- Gatilho de Agendamento RQ Iniciado (Fuso: SP) ---")
     while True:
         try:
             # Pega o horário atual em São Paulo
             now = datetime.now(tz_br)
-            # Todo dia às 00:05 enfileira o job de desbloqueio
-            if now.hour == 0 and now.minute == 5:
-                print(
-                    f"[{now.strftime('%d/%m/%Y %H:%M:%S')}] Enfileirando checagem diária de desbloqueios no RQ..."
-                )
-                # Colocamos o job na fila shopee_tasks
-                shopee_queue.enqueue(
-                    "controller.shopeeUpdate.shopeeUpdateController.run_unlock_check_job"
-                )
+            
+            from model.shopeeModel import IntegracaoShopee, Configuracoes
+            from datetime import datetime as dt_utc, timedelta
 
-                # Dorme por 15 minutos para garantir que não enfileire novamente na mesma janela
-                time.sleep(900)
+            with app.app_context():
+                config = Configuracoes.query.first()
+                integracao = IntegracaoShopee.query.first()
+                
+                # 1. Checagem de Token Shopee
+                if integracao and integracao.last_access_update_at:
+                    agora_utc = dt_utc.utcnow()
+                    # Busca a configuração de intervalo do banco (ou usa 230 min como fallback)
+                    intervalo_min = config.intervalo_refresh_token if config else 230
+                    
+                    # Se o token tem mais que o intervalo definido, enfileira a renovação
+                    if (agora_utc - integracao.last_access_update_at) >= timedelta(
+                        minutes=intervalo_min
+                    ):
+                        print(
+                            f"[{now.strftime('%H:%M:%S')}] Token Shopee próximo do limite ({intervalo_min} min). Enfileirando renovação no RQ..."
+                        )
+                        shopee_queue.enqueue(
+                            "controller.auth.authShopee.run_token_refresh_job",
+                            job_id="shopee_token_refresh_auto",
+                        )
 
-            # Verifica a cada 1 minuto se já é meia-noite
+                # 2. Sincronização COMPLETA Agendada
+                target_h = config.hora_sincronizacao if config else 0
+                target_m = config.minuto_sincronizacao if config else 15
+
+                if now.hour == target_h and now.minute == target_m:
+                    print(
+                        f"[{now.strftime('%d/%m/%Y %H:%M:%S')}] Enfileirando SINCRONIZAÇÃO COMPLETA agendada ({target_h:02d}:{target_m:02d}) no RQ..."
+                    )
+                    shopee_queue.enqueue(
+                        "controller.shopeeUpdate.shopeeUpdateController.run_full_sync_job"
+                    )
+                    # Dorme por 70 segundos para garantir que saia da janela do minuto atual
+                    time.sleep(70)
+
+            # Verifica a cada 1 minuto
             time.sleep(60)
         except Exception as e:
-            print(f"?? Erro no gatilho de agendamento: {e}")
+            print(f"?? Erro no agendamento da Fila: {e}")
             time.sleep(60)
 
 
 # Inicia a thread de checagem (necessário mover para fora do if __main__ para rodar no Gunicorn)
 import threading
+
 checker_thread = threading.Thread(target=background_checker, daemon=True)
 checker_thread.start()
 

@@ -1,6 +1,3 @@
-import eventlet
-eventlet.monkey_patch()
-
 import os
 import sys
 from dotenv import load_dotenv
@@ -26,12 +23,13 @@ def start_worker():
         
         if is_windows:
             print("--- RQ SimpleWorker Iniciado (Modo Windows) ---")
+            # No Windows, desativamos o timeout handler para evitar erros de Thread ID
             worker = SimpleWorker(listen, connection=redis_conn)
         else:
             print("--- RQ Worker Iniciado (Modo Linux/Produção) ---")
             worker = Worker(listen, connection=redis_conn)
             
-        worker.work()
+        worker.work(with_scheduler=True)
 
 if __name__ == '__main__':
     start_worker()

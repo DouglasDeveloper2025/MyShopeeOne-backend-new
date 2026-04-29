@@ -104,6 +104,7 @@ def shopee_callback():
 
 
 @shopee_bp.route("/shopee/integration-status", methods=["GET"])
+@token_required
 def get_integration_status():
     """
     Verifica se a integração com a Shopee está configurada e retorna o status atual.
@@ -118,28 +119,54 @@ def get_integration_status():
         # Calcula tempo de expiração
         expires_at = None
         if integracao.last_access_update_at and integracao.expire_in:
+            # Forçar o sufixo Z para que o frontend saiba que a data está em UTC e não local
             expires_at = (
                 integracao.last_access_update_at
                 + timedelta(seconds=integracao.expire_in)
-            ).isoformat()
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        # Se existir, retorna o status real do banco (Ativo, Pendente, etc)
-        return (
-            jsonify(
-                {
-                    "status": integracao.status or "Pendente",
-                    "shop_id": integracao.shop_id or "",
-                    "name": integracao.name or "",
-                    "partner_id": integracao.partner_id or "",
-                    "partner_key": integracao.partner_key or "",
-                    "expires_at": expires_at,
-                }
-            ),
-            200,
-        )
+        response_data = {
+            "status": integracao.status or "Pendente",
+            "shop_id": integracao.shop_id or "",
+            "name": integracao.name or "",
+            "partner_id": integracao.partner_id or "",
+            "partner_key": integracao.partner_key or "",
+            "expires_at": expires_at,
+        }
+
+        # APENAS Admins podem ver o Token de Acesso real por segurança
+        if hasattr(g, "current_user") and g.current_user and g.current_user.role == "admin":
+            response_data["access_token"] = integracao.last_access_token
+
+        return jsonify(response_data), 200
 
     except Exception as e:
         return jsonify({"status": "erro", "mensagem": f"Erro interno: {str(e)}"}), 500
+
+
+@shopee_bp.route("/shopee/refresh-token", methods=["POST"])
+@token_required
+def manual_refresh_token():
+    """Força a renovação do token de acesso da Shopee."""
+    try:
+        integracao = IntegracaoShopee.query.first()
+        if not integracao:
+            return jsonify({"status": "erro", "mensagem": "Nenhuma integração encontrada"}), 404
+        
+        resultado, erro = auth_shopee._refresh_token(integracao)
+        if erro:
+            return jsonify({"status": "erro", "mensagem": erro}), 400
+        
+        return jsonify({
+            "status": "sucesso", 
+            "mensagem": "Token renovado com sucesso!",
+            "expires_at": (
+                integracao.last_access_update_at 
+                + timedelta(seconds=integracao.expire_in)
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        }), 200
+    except Exception as e:
+        return jsonify({"status": "erro", "mensagem": str(e)}), 500
 
 
 def _format_announcement(a: Anuncios, dias_espera: int = 0):
@@ -257,8 +284,8 @@ def _format_announcement(a: Anuncios, dias_espera: int = 0):
                                 if (base_prod.preco_promocional and base_prod.preco_promocional > 0)
                                 else base_prod.preco_base
                             )
-                            # Regra: (Preço * Quantidade) com desconto fixo de 1%
-                            calc = (base_calc_price * n) * 0.99
+                            # Regra Progressiva: (Preço * Quantidade) * (0.99 ^ (n-1))
+                            calc = (base_calc_price * n) * (0.99 ** (n - 1))
                             suggested_price = round(calc, 2)
 
                             # Log para o usuário verificar no terminal (app.py)
@@ -336,7 +363,8 @@ def get_sync_progress():
     return jsonify(res), 200
 
 
-@shopee_bp.route("/shopee/cancel-sync", methods=["POST"])
+@shopee_bp.route("/shopee/cancel-sync", methods=["GET", "POST"])
+@token_required
 def cancel_sync():
     res = shopee_service.cancelar_sincronizacao()
     return jsonify(res), 200
@@ -858,10 +886,30 @@ def update_config():
 
         if dias is not None:
             config.dias_espera_simples = int(dias)
+            db.session.commit()
+            
+            # Gatilho: Revalidar as travas IMEDIATAMENTE
+            from controller.shopeeUpdate.shopeeUpdateController import ShopeeService
+            service = ShopeeService()
+            service.revalidate_all_locks()
+
+        # Novos campos de horário
+        hora = dados.get("hora_sincronizacao")
+        minuto = dados.get("minuto_sincronizacao")
+        
+        if hora is not None:
+            config.hora_sincronizacao = int(hora)
+        if minuto is not None:
+            config.minuto_sincronizacao = int(minuto)
+            
+        # Novo campo de intervalo de token
+        intervalo = dados.get("intervalo_refresh_token")
+        if intervalo is not None:
+            config.intervalo_refresh_token = int(intervalo)
 
         db.session.commit()
         return (
-            jsonify({"status": "sucesso", "mensagem": "Configurações atualizadas!"}),
+            jsonify({"status": "sucesso", "mensagem": "Configurações atualizadas e travas revalidadas!"}),
             200,
         )
     except Exception as e:
@@ -1076,6 +1124,20 @@ def delete_discount(discount_id):
         return jsonify({"status": "erro", "mensagem": str(e)}), 500
 
 
+@shopee_bp.route("/shopee/discounts/sync-all", methods=["POST"])
+def sync_all_campaigns_route():
+    """Sincroniza todas as campanhas ativas e seus itens."""
+    try:
+        creds, erro = auth_shopee.ensure_valid_token()
+        if erro:
+            return jsonify({"status": "erro", "mensagem": erro}), 401
+
+        res = shopee_service.sync_all_active_campaigns(creds)
+        return jsonify(res), 200
+    except Exception as e:
+        return jsonify({"status": "erro", "mensagem": str(e)}), 500
+
+
 @shopee_bp.route("/shopee/discounts/<discount_id>/items", methods=["GET"])
 def get_discount_items(discount_id):
     """Lista itens de uma promoção específica."""
@@ -1088,9 +1150,10 @@ def get_discount_items(discount_id):
             return jsonify({"status": "erro", "mensagem": erro}), 401
 
         search = request.args.get("search", "")
+        force_sync = request.args.get("sync", "false").lower() == "true"
 
         res = shopee_service.get_discount_item_list(
-            creds, discount_id, page=page, page_size=page_size, search=search
+            creds, discount_id, page=page, page_size=page_size, search=search, force_sync=force_sync
         )
         return jsonify(res), 200
     except Exception as e:
@@ -1146,6 +1209,28 @@ def get_item_info(item_id):
         if not anuncio:
             return jsonify({"status": "erro", "mensagem": "Item não encontrado"}), 404
         return jsonify(anuncio.to_dict()), 200
+    except Exception as e:
+        return jsonify({"status": "erro", "mensagem": str(e)}), 500
+
+
+@shopee_bp.route("/shopee/alerts/auto-promote", methods=["POST"])
+def auto_promote_route():
+    """Aciona a promoção automática de 25% para um item de alerta."""
+    try:
+        dados = request.get_json()
+        item_id = dados.get("item_id")
+        model_id = dados.get("model_id", "0")
+
+        if not item_id:
+            return jsonify({"status": "erro", "mensagem": "Item ID é obrigatório"}), 400
+
+        creds, erro = auth_shopee.ensure_valid_token()
+        if erro:
+            return jsonify({"status": "erro", "mensagem": erro}), 401
+
+        res, code = shopee_service.auto_promote_item(creds, item_id, model_id)
+        
+        return jsonify(res), code
     except Exception as e:
         return jsonify({"status": "erro", "mensagem": str(e)}), 500
 

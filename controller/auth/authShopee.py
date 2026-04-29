@@ -26,7 +26,9 @@ class TokenShopee:
             if not integration_name or integration_name == "":
                 integracao = IntegracaoShopee.query.first()
             else:
-                integracao = IntegracaoShopee.query.filter_by(name=integration_name).first()
+                integracao = IntegracaoShopee.query.filter_by(
+                    name=integration_name
+                ).first()
 
             if integracao:
                 integracao.status = "Pendente"
@@ -65,14 +67,16 @@ class TokenShopee:
             if integration_id:
                 integracao = db.session.get(IntegracaoShopee, integration_id)
             else:
-                integracao = IntegracaoShopee.query.filter_by(status="Pendente").first() or IntegracaoShopee.query.first()
+                integracao = (
+                    IntegracaoShopee.query.filter_by(status="Pendente").first()
+                    or IntegracaoShopee.query.first()
+                )
 
             if not integracao:
                 return {"status": "erro", "mensagem": "Integração não encontrada"}
 
             # Salva o code recebido
             integracao.code = code
-
 
             path = "/api/v2/auth/token/get"
             timestamp = int(time.time())
@@ -104,16 +108,17 @@ class TokenShopee:
                 integracao.shop_id = str(shop_id)
                 integracao.status = "Ativo"
                 integracao.expire_in = data.get("expire_in", 14400)
-                integracao.last_access_update_at = datetime.now(tz_br).replace(tzinfo=None)
+                integracao.last_access_update_at = datetime.utcnow()
                 db.session.commit()
                 return {"status": "sucesso"}
-
 
             # Idempotência: Se o erro for 'invalid_code', mas a integração já estiver 'Ativo'
             # e tiver sido atualizada recentemente (últimos 60 segundos), consideramos sucesso.
             # Isso evita erros em chamadas duplicadas do frontend.
             if data.get("error") == "invalid_code" and integracao.status == "Ativo":
-                if integracao.last_access_update_at and (datetime.now(tz_br).replace(tzinfo=None) - integracao.last_access_update_at) < timedelta(seconds=60):
+                if integracao.last_access_update_at and (
+                    datetime.utcnow() - integracao.last_access_update_at
+                ) < timedelta(seconds=60):
                     return {"status": "sucesso"}
 
             return {"status": "erro", "detalhes": data}
@@ -134,12 +139,19 @@ class TokenShopee:
             p_id = os.getenv("SHOPEE_PARTNER_ID")
             p_key = os.getenv("SHOPEE_PARTNER_KEY")
             if p_id and p_key:
-                return None, "Integração pendente. Por favor, autorize sua loja Shopee na página de configurações para atualizar preços."
-            return None, "A integração com a Shopee não foi encontrada. Configure suas chaves no painel de configurações."
+                return (
+                    None,
+                    "Integração pendente. Por favor, autorize sua loja Shopee na página de configurações para atualizar preços.",
+                )
+            return (
+                None,
+                "A integração com a Shopee não foi encontrada. Configure suas chaves no painel de configurações.",
+            )
 
         if integracao.last_access_token and integracao.last_access_update_at:
-            agora_br = datetime.now(tz_br).replace(tzinfo=None)
-            if (agora_br - integracao.last_access_update_at) < timedelta(
+            # Usar UTC para evitar problemas de fuso horário que fazem o token parecer válido quando não é
+            agora_utc = datetime.utcnow()
+            if (agora_utc - integracao.last_access_update_at) < timedelta(
                 hours=3, minutes=50
             ):
                 return {
@@ -181,7 +193,7 @@ class TokenShopee:
                 integracao.last_access_token = resp["access_token"]
                 integracao.refresh_token = resp["refresh_token"]
                 integracao.expire_in = resp.get("expire_in", 14400)
-                integracao.last_access_update_at = datetime.now(tz_br).replace(tzinfo=None)
+                integracao.last_access_update_at = datetime.utcnow()
                 db.session.commit()
                 return {
                     "access_token": integracao.last_access_token,
@@ -193,3 +205,40 @@ class TokenShopee:
             return None, f"Erro renovação: {resp}"
         except Exception as e:
             return None, str(e)
+
+
+def run_token_refresh_job():
+    """Job do RQ para renovar o token da Shopee automaticamente."""
+    from app import app
+    from model.shopeeModel import IntegracaoShopee
+    from controller.auth.authShopee import TokenShopee
+    from datetime import datetime, timedelta
+
+    with app.app_context():
+        integracao = IntegracaoShopee.query.first()
+        if not integracao:
+            print("--- [RQ TOKEN] Nenhuma integração encontrada para renovar. ---")
+            return
+
+        # Verifica se realmente precisa renovar (evita renovações duplicadas se o job rodar colado com outro)
+        agora = datetime.utcnow()
+        if integracao.last_access_update_at:
+            tempo_desde_update = agora - integracao.last_access_update_at
+            if tempo_desde_update < timedelta(hours=3, minutes=45):
+                print(
+                    f"--- [RQ TOKEN] Token ainda é recente ({tempo_desde_update}). Pulando renovação. ---"
+                )
+                return
+
+        print(
+            f"--- [RQ TOKEN] Iniciando renovação automática para: {integracao.name} ---"
+        )
+        tokens = TokenShopee()
+        creds, erro = tokens._refresh_token(integracao)
+
+        if erro:
+            print(f"--- [RQ TOKEN ERROR] Falha ao renovar: {erro} ---")
+        else:
+            print(
+                f"--- [RQ TOKEN SUCCESS] Token renovado com sucesso às {datetime.now()} ---"
+            )

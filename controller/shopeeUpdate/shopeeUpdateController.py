@@ -109,7 +109,23 @@ class ShopeeService:
             else:
                 resp = requests.get(url, params=default_params, timeout=60)
 
-            return resp.json(), resp.status_code
+            status_code = resp.status_code
+            
+            # TENTATIVA DE AUTO-RECOVERY EM CASO DE 403 (TOKEN INVÁLIDO/EXPIRADO)
+            if status_code == 403:
+                print(f"--- [403 DETECTED] Erro de autenticação em {path}. Tentando renovar token... ---")
+                from model.shopeeModel import IntegracaoShopee
+                integracao = IntegracaoShopee.query.first()
+                if integracao:
+                    new_creds, erro = self.tokens._refresh_token(integracao)
+                    if not erro:
+                        print("--- [403 RECOVERY] Token renovado! Repetindo requisição... ---")
+                        # Recalcular assinatura com novo token e repetir (retry_on_403=False para evitar loop)
+                        return self._shopee_request(path, new_creds, params, method, json_data)
+                    else:
+                        print(f"--- [403 FAILURE] Falha ao renovar token: {erro} ---")
+
+            return resp.json(), status_code
         except Exception as e:
             return {"error": str(e)}, 500
 
@@ -137,31 +153,49 @@ class ShopeeService:
 
     def _run_sync_worker_logic(self, item_ids, creds):
         """Lógica central de sincronização que atualiza o Redis."""
+        from config.redis_config import redis_conn
+
         try:
             total = len(item_ids)
+            # Resetar flags e status para novo início
+            redis_conn.delete("shopee_sync_cancel")
+
             self._update_sync_status(
                 is_running=True,
                 total=total,
                 atual=0,
                 sucessos=0,
                 erros=0,
-                mensagem="Sincronizando itens em lote...",
+                mensagem="Iniciando sincronização em lote...",
             )
 
             BATCH_SIZE = 50
             print(
                 f"--- [DEBUG] Iniciando processamento de {total} itens em lotes de {BATCH_SIZE} ---"
             )
+
             for i in range(0, total, BATCH_SIZE):
+                # Verificar cancelamento via Redis (Checagem mais frequente)
+                cancel_signal = redis_conn.get("shopee_sync_cancel")
+                if cancel_signal:
+                    print(f"--- [SYNC] CANCELAMENTO DETECTADO no Lote {current_batch_num}. Parando... ---")
+                    self._update_sync_status(is_running=False, mensagem="Sincronização interrompida pelo usuário.")
+                    return
+
                 batch_ids = item_ids[i : i + BATCH_SIZE]
+                current_batch_num = (i // BATCH_SIZE) + 1
                 print(
-                    f"--- [DEBUG] Processando lote {i//BATCH_SIZE + 1} ({len(batch_ids)} IDs) ---"
+                    f"--- [DEBUG] Lote {current_batch_num}: Processando {len(batch_ids)} IDs ---"
                 )
 
                 try:
                     res_batch = self.sync_batch_from_shopee(batch_ids, creds)
+                    
+                    # Verificação dupla após a chamada da API (que é o que mais demora)
+                    if redis_conn.get("shopee_sync_cancel"):
+                        return
 
-                    # Lê progresso atual para incrementar
+                    # Atualização atômica de progresso
                     prog = self.get_sync_progress()
                     prog["atual"] = min(i + len(batch_ids), total)
                     prog["sucessos"] += res_batch.get("sucessos", 0)
@@ -169,10 +203,14 @@ class ShopeeService:
                     prog["mensagem"] = f"Sincronizando: {prog['atual']}/{total}"
 
                     self._update_sync_status(**prog)
+                    print(
+                        f"--- [DEBUG] Lote {current_batch_num} OK: {res_batch.get('sucessos')} sucessos ---"
+                    )
                 except Exception as e_batch:
-                    print(f"❌ Erro no lote: {e_batch}")
+                    print(f"❌ Erro no lote {current_batch_num}: {e_batch}")
                     prog = self.get_sync_progress()
                     prog["erros"] += len(batch_ids)
+                    prog["atual"] = min(i + len(batch_ids), total)
                     self._update_sync_status(**prog)
 
                 time.sleep(0.5)
@@ -182,6 +220,7 @@ class ShopeeService:
                 is_running=False,
                 mensagem=f"Finalizado: {final['sucessos']} sucessos, {final['erros']} erros.",
             )
+            print(f"--- [SYNC] Processo finalizado com sucesso. Total: {total} ---")
 
             # Verificar desbloqueios de 15 dias após sincronizar
             self.verificar_desbloqueios(item_ids)
@@ -231,13 +270,18 @@ class ShopeeService:
             # 3. Processar em Lotes de 50
             BATCH_SIZE = 50
             for i in range(0, len(item_ids), BATCH_SIZE):
-                if self.cancel_requested:
+                # Checar sinal no Redis (Unificado)
+                from config.redis_config import redis_conn
+                if self.cancel_requested or redis_conn.get("shopee_sync_cancel"):
                     self.sync_status.update(
                         {
                             "is_running": False,
                             "mensagem": "Sincronização cancelada pelo usuário.",
                         }
                     )
+                    # Limpar flag local e no redis
+                    self.cancel_requested = False
+                    redis_conn.delete("shopee_sync_cancel")
                     return
 
                 batch_ids = item_ids[i : i + BATCH_SIZE]
@@ -531,6 +575,8 @@ class ShopeeService:
 
     def get_item_ids(self, creds):
         """Busca todos os IDs de itens da loja (NORMAL e UNLIST)."""
+        from config.redis_config import redis_conn
+
         path = "/api/v2/product/get_item_list"
         item_ids = []
 
@@ -542,7 +588,11 @@ class ShopeeService:
             has_next_page = True
 
             while has_next_page:
-                if self.cancel_requested:
+                # Verificar cancelamento via Redis
+                cancel_signal = redis_conn.get("shopee_sync_cancel")
+                if cancel_signal: # Checagem simplificada (qualquer valor no Redis cancela)
+                    print("--- [SYNC] Cancelamento detectado durante busca de IDs. Interrompendo... ---")
+                    self._update_sync_status(is_running=False, mensagem="Cancelado durante busca de anúncios.")
                     return item_ids
 
                 params = {
@@ -551,23 +601,46 @@ class ShopeeService:
                     "item_status": status,
                 }
 
+                print(f"--- [DEBUG] Buscando {status} (Offset: {offset})... ---")
                 resp_json, code = self._shopee_request(path, creds, params=params)
+                
                 if code != 200:
+                    print(f"⚠️ Erro ao buscar IDs (Status {status}, Offset {offset}): {code} - Resposta: {resp_json}")
                     break
 
                 response = resp_json.get("response", {})
                 items = response.get("item", [])
+                
+                print(f"--- [DEBUG] Shopee retornou {len(items)} itens para {status} ---")
+
+                if not items:
+                    break
+
                 for item in items:
                     item_ids.append(item["item_id"])
+
+                # Atualizar progresso na tela em tempo real durante a coleta
+                self._update_sync_status(
+                    is_running=True, 
+                    mensagem=f"Coletando anúncios na Shopee: {len(item_ids)}..."
+                )
 
                 has_next_page = response.get("has_next_page", False)
                 if has_next_page:
                     offset += 100
+                    print(f"--- [DEBUG] Indo para próxima página (Novo Offset: {offset}) ---")
+                else:
+                    print(f"--- [DEBUG] Fim das páginas para {status} ---")
+                    break
 
+        print(f"--- [DEBUG] Total final de IDs coletados: {len(item_ids)} ---")
         return item_ids
 
     def cancelar_sincronizacao(self):
-        """Solicita o cancelamento da sincronização em andamento."""
+        """Solicita o cancelamento da sincronização em andamento via Redis."""
+        from config.redis_config import redis_conn
+
+        redis_conn.set("shopee_sync_cancel", "true", ex=600)  # Flag dura 10 min
         self.cancel_requested = True
         return {"status": "sucesso", "mensagem": "Cancelamento solicitado."}
 
@@ -597,6 +670,7 @@ class ShopeeService:
                                 mensagem=f"Produto Desbloqueado e Pronto para ser Adicionado em Promoção.",
                                 item_id=p.shopee_item_id,
                                 model_id=p.shopee_model_id,
+                                sku=p.sku,
                             )
                             p.notificado_desbloqueio = True
                             db.session.add(p)
@@ -776,6 +850,7 @@ class ShopeeService:
                             mensagem=f"Esse anuncio está temporariamente bloqueado por Segurança, aguarde {dias_espera} dias para alterar o preço novamente ou Adicione ele em uma Promoção.",
                             item_id=str(item_id),
                             model_id=str(model_id),
+                            sku=sku,
                         )
 
                     prod.updated_at = agora_br
@@ -956,6 +1031,21 @@ class ShopeeService:
                             "status": "erro",
                             "mensagem": "Nenhuma promoção ativa (Ongoing) encontrada na loja para vincular o item.",
                         }
+                elif force_promotion:
+                    # Se for forçar promoção mas o item NÃO está nela, checar limite de 1000
+                    ongoing_promo_id = self._find_any_ongoing_discount(creds)
+                    if ongoing_promo_id:
+                        count_promo = (
+                            db.session.query(Produtos.shopee_item_id)
+                            .filter_by(promotion_id=str(ongoing_promo_id))
+                            .distinct()
+                            .count()
+                        )
+                        if count_promo >= 995:
+                            return {
+                                "status": "erro",
+                                "mensagem": f"A campanha automática atingiu o limite de anúncios ({count_promo}/1000). Remova itens ou crie uma nova na Shopee.",
+                            }, 400
                 else:
                     # --- NOVO: Validação de Segurança (Preço Base) ---
                     dias_espera = self._get_wait_time_config()
@@ -1182,7 +1272,7 @@ class ShopeeService:
         payload = {"discount_id": int(discount_id), "item_list": item_list}
         return self.request_shopee(path, creds, payload)
 
-    def _criar_notificacao(self, tipo, titulo, mensagem, item_id=None, model_id=None):
+    def _criar_notificacao(self, tipo, titulo, mensagem, item_id=None, model_id=None, sku=None):
         """Cria uma notificação no banco e emite via WebSocket."""
         try:
             from model.shopeeModel import NotificacaoSistema, db
@@ -1194,6 +1284,7 @@ class ShopeeService:
                 mensagem=mensagem,
                 shopee_item_id=str(item_id) if item_id else None,
                 shopee_model_id=str(model_id) if model_id else None,
+                sku=sku,
             )
             db.session.add(nova)
             db.session.commit()
@@ -1626,6 +1717,10 @@ class ShopeeService:
                                 int(p.end_time.timestamp()) if p.end_time else 0
                             ),
                             "discount_status": p.status or "unknown",
+                            "item_count": db.session.query(Produtos.shopee_item_id)
+                            .filter_by(promotion_id=str(p.discount_id))
+                            .distinct()
+                            .count(),
                         }
                         for p in promos
                     ],
@@ -1670,6 +1765,13 @@ class ShopeeService:
                         )
                         item["discount_status"] = st_api
                         item["discount_id"] = str(item["discount_id"])
+                        # Apenas contar itens já salvos localmente (evitar sync pesado aqui)
+                        item["item_count"] = (
+                            db.session.query(Produtos.shopee_item_id)
+                            .filter_by(promotion_id=item["discount_id"])
+                            .distinct()
+                            .count()
+                        )
 
                     all_discounts.extend(items)
 
@@ -1745,6 +1847,37 @@ class ShopeeService:
                 print(f"Falha crítica no fallback: {str(ef)}")
                 return {"discount_list": [], "more": False}
 
+    def sync_all_active_campaigns(self, creds):
+        """Sincroniza a lista de campanhas e, para cada uma ativa/agendada, sincroniza os itens detalhadamente."""
+        try:
+            # 1. Atualiza a lista de campanhas (Ongoing e Upcoming)
+            print("--- Iniciando Sincronização Global de Campanhas ---")
+            res_list = self.get_shopee_discounts(creds, status="all", force_sync=True)
+            if res_list.get("status") == "error":
+                return res_list
+
+            discounts = res_list.get("discount_list", [])
+            active_statuses = ["ongoing", "upcoming"]
+            
+            sync_count = 0
+            for d in discounts:
+                status = d.get("discount_status")
+                did = d.get("discount_id")
+                
+                if status in active_statuses:
+                    print(f"-> Sincronizando itens da campanha: {d.get('discount_name')} ({did})")
+                    # Chama o sync detalhado de itens (já com lógica de no_autoflush e retry)
+                    self.get_discount_item_list(creds, did, page=1)
+                    sync_count += 1
+            
+            print(f"--- Sincronização Global Concluída: {sync_count} campanhas processadas ---")
+            return {"status": "sucesso", "campanhas_processadas": sync_count}
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return {"status": "erro", "mensagem": str(e)}
+
     def add_shopee_discount(self, creds, name, start_time, end_time):
         """Cria uma nova campanha de promoção e salva no Banco Local."""
         from model.shopeeModel import Promocoes, db
@@ -1810,78 +1943,153 @@ class ShopeeService:
         return self._shopee_request(path, creds, method="POST", json_data=payload)
 
     def get_discount_item_list(
-        self, creds, discount_id, page=1, page_size=20, search=None
+        self, creds, discount_id, page=1, page_size=20, search=None, force_sync=False
     ):
         """Lista os itens vinculados a uma promoção, sincronizando com a Shopee para garantir consistência."""
         from model.shopeeModel import Produtos, Anuncios
+        from datetime import datetime
+        import time
 
         # 1. Sincronização Ativa com a Shopee (Sempre executada na primeira página para garantir dados novos)
-        if page == 1:
+        # 1. Sincronização Ativa com a Shopee (Apenas se forçar ou se não houver dados locais e for página 1)
+        if page == 1 and force_sync:
             try:
-                path = "/api/v2/discount/get_discount_item_list"
-                params = {
-                    "discount_id": int(discount_id),
-                    "page_no": 1,
-                    "page_size": 100,  # Busca um lote maior para popular o banco inicialmente
-                }
-                resp, code = self._shopee_request(path, creds, params=params)
+                path = "/api/v2/discount/get_discount"
+                current_sync_page = 1
+                has_next_page = True
+                current_item_models = set()
+                has_fetched_any = False # Flag de segurança: só limpa o banco se conseguiu baixar algo
 
-                if code == 200 and "response" in resp:
-                    res = resp.get("response", {})
-                    raw_items = res.get("item_list", [])
+                # SEGURANÇA: Usar no_autoflush para evitar que o SQLAlchemy envie UPDATES pro banco
+                # no meio do loop (o que causa locks e deadlocks ao fazer novas queries)
+                with db.session.no_autoflush:
+                    while has_next_page:
+                        params = {
+                            "discount_id": int(discount_id),
+                            "page_no": current_sync_page,
+                            "page_size": 100,
+                        }
+                        resp, code = self._shopee_request(path, creds, params=params)
 
-                    # Marcar IIDs e MIDs que estão na Shopee para limpar os que saíram
-                    current_item_models = set()
+                        raw_items = []
+                        if code == 200 and "response" in resp:
+                            res_data = resp["response"]
+                            raw_items = res_data.get("item_list", [])
+                            has_next_page = res_data.get("more", False)
+                            has_fetched_any = True
+                            print(f"DEBUG SYNC: Campanha {discount_id} - Pagina {current_sync_page} retornou {len(raw_items)} itens.")
+                        else:
+                            print(f"DEBUG SYNC: Campanha {discount_id} - Erro na API (Status {code}): {resp}")
+                            has_next_page = False
 
-                    for item in raw_items:
-                        iid = str(item.get("item_id"))
-                        models = item.get("model_list", [])
+                        for item in raw_items:
+                            iid = str(item.get("item_id"))
+                            models = item.get("model_list", [])
 
-                        # Processar cada variação ou o item base se não houver modelos
-                        model_data_list = models if models else [item]
-                        for m in model_data_list:
-                            mid = str(m.get("model_id", "0"))
+                            # Processar cada variação ou o item base se não houver modelos
+                            model_data_list = models if models else [item]
+                            for m in model_data_list:
+                                mid = str(m.get("model_id", "0"))
 
-                            # Conversões robustas para evitar crash com nulls da API
-                            try:
-                                orig = float(m.get("original_price") or 0.0)
-                                promo = float(
-                                    m.get("promotion_price")
-                                    or item.get("item_promotion_price")
-                                    or 0.0
-                                )
-                            except (TypeError, ValueError):
-                                orig = 0.0
-                                promo = 0.0
+                                # Conversões robustas para evitar crash com nulls da API
+                                try:
+                                    # Prioriza o preço promocional da Shopee se existir
+                                    p_promo = m.get("model_promotion_price") or item.get("item_promotion_price")
+                                    # Se não houver preço promocional explícito, mas o current_price for diferente do original_price
+                                    # podemos inferir que existe uma promoção (comum em algumas versões da API)
+                                    orig = float(m.get("original_price") or 0.0)
+                                    
+                                    promo = float(p_promo) if p_promo else None
+                                except (TypeError, ValueError):
+                                    orig = 0.0
+                                    promo = None
 
-                            current_item_models.add((iid, mid))
+                                current_item_models.add((iid, mid))
 
-                            # Atualizar ou criar registro local se necessário (só se já tivermos o anúncio indexado)
-                            p = Produtos.query.filter_by(
-                                shopee_item_id=iid, shopee_model_id=mid
-                            ).first()
-                            if p:
-                                p.promotion_id = str(discount_id)
-                                p.preco_promocional = promo
-                                if orig > 0:
-                                    p.preco_base = orig
+                                # 1. Garantir que o Anúncio Pai exista e esteja completo
+                                anuncio = Anuncios.query.filter_by(shopee_item_id=iid).first()
+                                if not anuncio:
+                                    anuncio = Anuncios(
+                                        shopee_item_id=iid,
+                                        nome=item.get("item_name", "Anúncio Importado"),
+                                        sku_pai=item.get("item_sku", ""),
+                                    )
+                                    db.session.add(anuncio)
+                                    db.session.flush()
+                                else:
+                                    # Se já existe mas o SKU ou nome está vazio, atualiza
+                                    if not anuncio.sku_pai and item.get("item_sku"):
+                                        anuncio.sku_pai = item.get("item_sku")
+                                    if (not anuncio.nome or anuncio.nome == "Anúncio Importado") and item.get("item_name"):
+                                        anuncio.nome = item.get("item_name")
 
-                    # Limpeza: itens que estavam nesta campanha localmente mas NÃO vieram na api da Shopee
-                    others = Produtos.query.filter(
-                        Produtos.promotion_id == str(discount_id)
-                    ).all()
-                    for op in others:
-                        if (
-                            op.shopee_item_id,
-                            op.shopee_model_id,
-                        ) not in current_item_models:
-                            op.promotion_id = None
-                            op.preco_promocional = None
+                                # 2. Atualizar ou criar o Produto (Variação)
+                                p = Produtos.query.filter_by(
+                                    shopee_item_id=iid, shopee_model_id=mid
+                                ).first()
+
+                                if not p:
+                                    p = Produtos(
+                                        shopee_item_id=iid,
+                                        shopee_model_id=mid,
+                                        nome_variacao=m.get("model_name", "Padrão"),
+                                        preco_base=orig,
+                                        sku=m.get("model_sku") or item.get("item_sku"),
+                                        anuncio_id=anuncio.id,
+                                    )
+                                    db.session.add(p)
+                                else:
+                                    # Se já existe, garante que o SKU e o vínculo com anúncio estão certos
+                                    if not p.sku:
+                                        p.sku = m.get("model_sku") or item.get("item_sku")
+                                    if not p.anuncio_id:
+                                        p.anuncio_id = anuncio.id
+                                    if (not p.nome_variacao or p.nome_variacao == "Padrão") and m.get("model_name"):
+                                        p.nome_variacao = m.get("model_name")
+                                    if orig > 0:
+                                        p.preco_base = orig
+
+                                if p:
+                                    p.promotion_id = str(discount_id)
+                                    p.preco_promocional = promo
+                                    p.updated_at = datetime.utcnow()
+
+                        db.session.commit()
+                        current_sync_page += 1
+                        if current_sync_page > 20:
+                            break
+                
+                # Se não conseguiu baixar nada (erro de API), registra o log mas permite continuar para mostrar o que tem no banco
+                if not has_fetched_any:
+                    print(f"⚠️ Sincronização falhou para campanha {discount_id}, exibindo dados locais.")
+
+                # Limpeza: itens que estavam nesta campanha localmente mas NÃO vieram na api da Shopee
+                # Otimizado: Usar update em lote para evitar locks individuais e timeouts
+                # SEGURANÇA: Só limpa se o sync teve sucesso (evita zerar banco em erro de API)
+                if has_fetched_any:
+                    others = Produtos.query.filter(Produtos.promotion_id == str(discount_id)).all()
+                    to_clear_ids = [
+                        op.id for op in others 
+                        if (op.shopee_item_id, op.shopee_model_id) not in current_item_models
+                    ]
+                    
+                    if to_clear_ids:
+                        from sqlalchemy import update
+                        db.session.query(Produtos).filter(Produtos.id.in_(to_clear_ids)).update(
+                            {Produtos.promotion_id: None, Produtos.preco_promocional: None},
+                            synchronize_session=False
+                        )
 
                     db.session.commit()
             except Exception as e:
                 db.session.rollback()
                 import traceback
+                
+                # Retry simples em caso de Deadlock (Psycopg2)
+                if "deadlock" in str(e).lower():
+                    print(f"🔄 Deadlock detectado na campanha {discount_id}. Tentando novamente em 1s...")
+                    time.sleep(1)
+                    return self.get_discount_item_list(creds, discount_id, page, page_size, search)
 
                 print(f"⚠️ Erro na sincronização passiva de campanha {discount_id}: {e}")
                 traceback.print_exc()
@@ -1933,14 +2141,94 @@ class ShopeeService:
                     }
                 )
 
+            # Contagem de IDs Únicos para o limite de 1000 da Shopee
+            total_unique_items = (
+                db.session.query(Produtos.shopee_item_id)
+                .filter(Produtos.promotion_id == str(discount_id))
+                .distinct()
+                .count()
+            )
+
             return {
                 "item_list": flat_items,
                 "total": total_items,
+                "total_unique": total_unique_items,
                 "pages": total_pages,
                 "more": has_more,
             }
 
         return {"item_list": [], "total": 0, "pages": 0, "more": False}
+
+    def auto_promote_item(self, creds, item_id, model_id):
+        """Busca uma campanha ativa com espaço e adiciona o item com 25% de desconto."""
+        from model.shopeeModel import Produtos, Promocoes, db
+        import time
+
+        try:
+            # 1. Buscar o produto para pegar o preço base
+            p = Produtos.query.filter_by(shopee_item_id=str(item_id), shopee_model_id=str(model_id)).first()
+            if not p:
+                return {"status": "erro", "mensagem": "Produto não encontrado no banco local."}, 404
+
+            if not p.preco_base or p.preco_base <= 0:
+                return {"status": "erro", "mensagem": "Produto sem preço base cadastrado."}, 400
+
+            # 2. Calcular preço com 25% de desconto
+            promo_price = round(p.preco_base * 0.75, 2)
+
+            # 3. Buscar uma campanha 'ongoing' que tenha espaço (< 1000 itens)
+            campaigns = Promocoes.query.filter_by(status="ongoing").order_by(Promocoes.end_time.asc()).all()
+            
+            target_campaign = None
+            for c in campaigns:
+                count = db.session.query(Produtos.shopee_item_id).filter_by(promotion_id=str(c.discount_id)).distinct().count()
+                if count < 1000:
+                    target_campaign = c
+                    break
+            
+            if not target_campaign:
+                # Tenta sincronizar a lista de campanhas para ver se há novas
+                self.get_shopee_discounts(creds, status="ongoing", force_sync=True)
+                campaigns = Promocoes.query.filter_by(status="ongoing").order_by(Promocoes.end_time.asc()).all()
+                for c in campaigns:
+                    count = db.session.query(Produtos.shopee_item_id).filter_by(promotion_id=str(c.discount_id)).distinct().count()
+                    if count < 1000:
+                        target_campaign = c
+                        break
+
+            if not target_campaign:
+                return {"status": "erro", "mensagem": "Nenhuma campanha ativa com espaço disponível encontrada."}, 404
+
+            # 4. Adicionar o item à campanha na Shopee
+            items_to_add = []
+            mid_int = int(model_id) if model_id and model_id != "0" else 0
+            
+            if mid_int == 0:
+                items_to_add.append({
+                    "item_id": int(item_id),
+                    "item_promotion_price": promo_price
+                })
+            else:
+                items_to_add.append({
+                    "item_id": int(item_id),
+                    "model_list": [{
+                        "model_id": mid_int,
+                        "model_promotion_price": promo_price
+                    }]
+                })
+
+            res, code = self.add_discount_item(creds, target_campaign.discount_id, items_to_add, log_msg="SF Auto-Promote (25% OFF)", origem="Alertas")
+            
+            if code == 200:
+                return {"status": "sucesso", "mensagem": f"Item em promoção na campanha '{target_campaign.discount_name}' com 25% OFF."}, 200
+            else:
+                return res, code
+
+        except Exception as e:
+            db.session.rollback()
+            import traceback
+            traceback.print_exc()
+            return {"status": "erro", "mensagem": str(e)}, 500
 
     def add_discount_item(
         self, creds, discount_id, items, log_msg="Anuncio em Promoção", origem=None
@@ -1948,6 +2236,17 @@ class ShopeeService:
         """
         Adiciona itens a uma promoção existente e atualiza o Banco Local.
         """
+        # --- NOVO: Limite de 995 Anúncios (Margem de Segurança) por Campanha ---
+        count_atual = (
+            db.session.query(Produtos.shopee_item_id)
+            .filter_by(promotion_id=str(discount_id))
+            .distinct()
+            .count()
+        )
+        if (count_atual + len(items)) > 995:
+            msg = f"Campanha no Limite ({count_atual}/1000). Remova itens da promoção para poder adicionar novos."
+            return {"status": "erro", "message": msg, "mensagem": msg}, 400
+
         # --- NOVO: Validação de Segurança (Preço Base Inflado) ---
         for itm in items:
             iid = str(itm.get("item_id"))
@@ -2074,40 +2373,97 @@ class ShopeeService:
 
         return resp, code
 
+    def revalidate_all_locks(self):
+        """Varre todos os produtos travados e desbloqueia os que passaram do tempo ou se a trava for 0."""
+        from model.shopeeModel import Produtos, Configuracoes, db
+        from datetime import datetime, timedelta
+        
+        config = Configuracoes.query.first()
+        dias_trava = config.dias_espera_simples if config else 15
+        
+        print(f"DEBUG LOCK: Iniciando revalidação com trava de {dias_trava} dias.")
+
+        # Se a trava for 0, desbloqueia TUDO que estiver com preco_modificado_em preenchido
+        if dias_trava <= 0:
+            count = db.session.query(Produtos).filter(Produtos.preco_modificado_em != None).update({
+                "preco_modificado_em": None
+            }, synchronize_session=False)
+            db.session.commit()
+            print(f"DEBUG LOCK: Trava 0 detectada. {count} anúncios desbloqueados automaticamente.")
+            return count
+            
+        # Caso contrário, verifica a data (UTC para bater com o banco)
+        limite = datetime.utcnow() - timedelta(days=dias_trava)
+        count = db.session.query(Produtos).filter(
+            Produtos.preco_modificado_em != None,
+            Produtos.preco_modificado_em <= limite
+        ).update({
+            "preco_modificado_em": None
+        }, synchronize_session=False)
+        db.session.commit()
+        print(f"DEBUG LOCK: {count} anúncios desbloqueados por atingirem o limite de {dias_trava} dias.")
+        return count
+
 
 def run_full_sync_job():
     """Job do RQ para sincronizar todos os anúncios vinculados."""
     from app import app
     from model.shopeeModel import Anuncios
+    from config.redis_config import redis_conn
+
+    # GARANTIR que começamos sem sinais de cancelamento antigos
+    redis_conn.delete("shopee_sync_cancel")
 
     with app.app_context():
         service = ShopeeService()
+        try:
+            # 1. Buscar credenciais válidas (pega a primeira loja configurada por padrão)
+            creds, erro = service.tokens.ensure_valid_token()
+            if erro:
+                print(f"--- [RQ ERROR] Token Inválido: {erro} ---")
+                service._update_sync_status(
+                    is_running=False, mensagem=f"Erro de Token: {erro}"
+                )
+                return
 
-        # 1. Buscar credenciais válidas (pega a primeira loja configurada por padrão)
-        creds, erro = service.tokens.ensure_valid_token()
-        if erro:
+            # 2. Resetar e buscar todos os IDs de itens DIRETAMENTE DA SHOPEE (Full Sync)
             service._update_sync_status(
-                is_running=False, mensagem=f"Erro de Token: {erro}"
+                is_running=True, 
+                total=0, 
+                atual=0, 
+                sucessos=0, 
+                erros=0, 
+                mensagem="Buscando lista de anúncios na Shopee..."
             )
-            return
 
-        # 2. Buscar todos os IDs de itens DIRETAMENTE DA SHOPEE (Full Sync)
-        service._update_sync_status(
-            is_running=True, 
-            mensagem="Buscando lista de anúncios na Shopee..."
-        )
-        
-        all_item_ids = service.get_item_ids(creds)
+            all_item_ids = service.get_item_ids(creds)
 
-        if not all_item_ids:
+            if not all_item_ids:
+                print("--- [RQ INFO] Nenhum ID coletado na Shopee. ---")
+                service._update_sync_status(
+                    is_running=False, mensagem="Nenhum anúncio encontrado na Shopee."
+                )
+                return
+
+            # 3. Executa a lógica de sincronização em lotes
+            print(f"--- [RQ START] Iniciando Worker para {len(all_item_ids)} itens ---")
+            service._run_sync_worker_logic(all_item_ids, creds)
+            print(
+                f"--- [RQ FINISH] Sincronização Finalizada: {len(all_item_ids)} itens processados ---"
+            )
+            
+            # 4. Revalidar travas após a sincronização
+            print("--- [RQ JOB] Revalidando travas de atualização ---")
+            service.revalidate_all_locks()
+            
+        except Exception as e:
+            import traceback
+
+            tb = traceback.format_exc()
+            print(f"--- [RQ CRITICAL ERROR] ---\n{tb}")
             service._update_sync_status(
-                is_running=False, mensagem="Nenhum anúncio encontrado na Shopee."
+                is_running=False, mensagem=f"Erro Crítico: {str(e)}"
             )
-            return
-
-        # 3. Executa a lógica de sincronização em lotes
-        service._run_sync_worker_logic(all_item_ids, creds)
-        print(f"--- [RQ JOB] Sincronização Finalizada: {len(all_item_ids)} itens processados ---")
 
 
 def run_unlock_check_job():

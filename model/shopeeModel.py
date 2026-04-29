@@ -67,6 +67,10 @@ class Configuracoes(db.Model):
     __tablename__ = "configuracoes"
     id = db.Column(db.Integer, primary_key=True)
     dias_espera_simples = db.Column(db.Integer, default=15)
+    # Novos campos de agendamento
+    hora_sincronizacao = db.Column(db.Integer, default=0)
+    minuto_sincronizacao = db.Column(db.Integer, default=15)
+    intervalo_refresh_token = db.Column(db.Integer, default=230) # minutos (padrão ~3h50m)
 
 class HistoricoPreco(db.Model):
     """
@@ -104,6 +108,7 @@ class NotificacaoSistema(db.Model):
     tipo = db.Column(db.String(50), nullable=False)  # 'bloqueio', 'desbloqueio', 'info', 'sucesso'
     shopee_item_id = db.Column(db.String(255), nullable=True)
     shopee_model_id = db.Column(db.String(255), nullable=True)
+    sku = db.Column(db.String(255), nullable=True)
     titulo = db.Column(db.String(255), nullable=False)
     mensagem = db.Column(db.Text, nullable=False)
     lida = db.Column(db.Boolean, default=False)
@@ -115,6 +120,7 @@ class NotificacaoSistema(db.Model):
             "tipo": self.tipo,
             "itemId": self.shopee_item_id,
             "modelId": self.shopee_model_id,
+            "sku": self.sku,
             "titulo": self.titulo,
             "mensagem": self.mensagem,
             "lida": self.lida,
