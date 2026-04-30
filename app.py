@@ -1,11 +1,21 @@
-import os
 import sys
+import os
 
-# Somente aplica o monkey_patch se NÃO estiver rodando o worker do RQ.
-# Isso evita conflitos com o multiprocessing do Python 3.14 no Render.
-if "worker.py" not in sys.argv[0]:
-    import eventlet
-    eventlet.monkey_patch()
+# --- APLICAÇÃO DO MONKEY PATCH (DEVE SER A PRIMEIRA COISA) ---
+# Detectamos se estamos rodando o worker do RQ para EVITAR o monkey_patch.
+# O monkey_patch no worker causa conflitos com o multiprocessing do Python 3.12+.
+is_worker = False
+if len(sys.argv) > 0 and ("worker.py" in sys.argv[0] or "rq" in sys.argv[0]):
+    is_worker = True
+if os.environ.get("IS_RQ_WORKER") == "true":
+    is_worker = True
+
+if not is_worker:
+    try:
+        import eventlet
+        eventlet.monkey_patch()
+    except ImportError:
+        pass
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -109,7 +119,7 @@ def background_checker():
 
 # Inicia a checagem em segundo plano de forma assíncrona compatível com eventlet
 # Somente se o eventlet foi carregado (não é worker)
-if "worker.py" not in sys.argv[0]:
+if not is_worker:
     import eventlet
     eventlet.spawn(background_checker)
 
