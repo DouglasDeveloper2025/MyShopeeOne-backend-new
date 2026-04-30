@@ -1,5 +1,6 @@
 import eventlet
-eventlet.monkey_patch()
+# Força o patch de forma agressiva para tentar capturar locks residuais
+eventlet.monkey_patch(all=True, thread=True)
 
 # Garante que o psycopg2 seja greened corretamente para evitar erros de SSL
 try:

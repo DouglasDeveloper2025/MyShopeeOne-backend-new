@@ -30,6 +30,24 @@ class ShopeeService:
             "mensagem": "Inativo",
         }
 
+    def _safe_emit(self, event, data):
+        """Emite evento via SocketIO de forma segura.
+        
+        Quando rodando no web server (com eventlet), importa o socketio normalmente.
+        Quando rodando no RQ Worker (sem eventlet), silenciosamente ignora a emissão
+        para evitar importar app.py e disparar eventlet.monkey_patch().
+        """
+        try:
+            import os
+            if os.environ.get("IS_RQ_WORKER") == "true":
+                # No worker, não temos SocketIO — apenas loga
+                print(f"[RQ Worker] SocketIO emit ignorado: {event}")
+                return
+            from app import socketio
+            socketio.emit(event, data)
+        except Exception as e:
+            print(f"[SocketIO] Falha ao emitir '{event}': {e}")
+
     def _get_brasilia_time(self):
         """Retorna o horário atual no fuso de Brasília como naive datetime (sem fuso)."""
         return datetime.now(self.tz_brasil).replace(tzinfo=None)
@@ -311,15 +329,11 @@ class ShopeeService:
 
             self.sync_status.update({"is_running": False, "mensagem": error_msg})
             # Emitir falha
-            from app import socketio
-
-            socketio.emit("sync_finished", {"sucesso": False, "erro": str(e)})
+            self._safe_emit("sync_finished", {"sucesso": False, "erro": str(e)})
         finally:
             # Emitir sucesso se não caiu no except crítico
             if not self.sync_status.get("error_critical"):
-                from app import socketio
-
-                socketio.emit(
+                self._safe_emit(
                     "sync_finished",
                     {
                         "sucesso": True,
@@ -1276,7 +1290,6 @@ class ShopeeService:
         """Cria uma notificação no banco e emite via WebSocket."""
         try:
             from model.shopeeModel import NotificacaoSistema, db
-            from app import socketio
 
             nova = NotificacaoSistema(
                 tipo=tipo,
@@ -1289,8 +1302,8 @@ class ShopeeService:
             db.session.add(nova)
             db.session.commit()
 
-            # Emitir via WebSocket para o frontend
-            socketio.emit("nova_notificacao", nova.to_dict())
+            # Emitir via WebSocket para o frontend (no-op se rodando no Worker)
+            self._safe_emit("nova_notificacao", nova.to_dict())
             return True
         except Exception as e:
             print(f"?? Erro ao criar notificação: {e}")
@@ -2406,72 +2419,74 @@ class ShopeeService:
 
 
 def run_full_sync_job():
-    """Job do RQ para sincronizar todos os anúncios vinculados."""
-    from app import app
+    """Job do RQ para sincronizar todos os anúncios vinculados.
+    
+    NOTA: O RQ Worker já empurra um app_context(), então NÃO importamos
+    'app' diretamente (isso puxaria eventlet e causaria BlockingIOError).
+    """
     from model.shopeeModel import Anuncios
     from config.redis_config import redis_conn
 
     # GARANTIR que começamos sem sinais de cancelamento antigos
     redis_conn.delete("shopee_sync_cancel")
 
-    with app.app_context():
-        service = ShopeeService()
-        try:
-            # 1. Buscar credenciais válidas (pega a primeira loja configurada por padrão)
-            creds, erro = service.tokens.ensure_valid_token()
-            if erro:
-                print(f"--- [RQ ERROR] Token Inválido: {erro} ---")
-                service._update_sync_status(
-                    is_running=False, mensagem=f"Erro de Token: {erro}"
-                )
-                return
-
-            # 2. Resetar e buscar todos os IDs de itens DIRETAMENTE DA SHOPEE (Full Sync)
+    service = ShopeeService()
+    try:
+        # 1. Buscar credenciais válidas (pega a primeira loja configurada por padrão)
+        creds, erro = service.tokens.ensure_valid_token()
+        if erro:
+            print(f"--- [RQ ERROR] Token Inválido: {erro} ---")
             service._update_sync_status(
-                is_running=True, 
-                total=0, 
-                atual=0, 
-                sucessos=0, 
-                erros=0, 
-                mensagem="Buscando lista de anúncios na Shopee..."
+                is_running=False, mensagem=f"Erro de Token: {erro}"
             )
+            return
 
-            all_item_ids = service.get_item_ids(creds)
+        # 2. Resetar e buscar todos os IDs de itens DIRETAMENTE DA SHOPEE (Full Sync)
+        service._update_sync_status(
+            is_running=True, 
+            total=0, 
+            atual=0, 
+            sucessos=0, 
+            erros=0, 
+            mensagem="Buscando lista de anúncios na Shopee..."
+        )
 
-            if not all_item_ids:
-                print("--- [RQ INFO] Nenhum ID coletado na Shopee. ---")
-                service._update_sync_status(
-                    is_running=False, mensagem="Nenhum anúncio encontrado na Shopee."
-                )
-                return
+        all_item_ids = service.get_item_ids(creds)
 
-            # 3. Executa a lógica de sincronização em lotes
-            print(f"--- [RQ START] Iniciando Worker para {len(all_item_ids)} itens ---")
-            service._run_sync_worker_logic(all_item_ids, creds)
-            print(
-                f"--- [RQ FINISH] Sincronização Finalizada: {len(all_item_ids)} itens processados ---"
-            )
-            
-            # 4. Revalidar travas após a sincronização
-            print("--- [RQ JOB] Revalidando travas de atualização ---")
-            service.revalidate_all_locks()
-            
-        except Exception as e:
-            import traceback
-
-            tb = traceback.format_exc()
-            print(f"--- [RQ CRITICAL ERROR] ---\n{tb}")
+        if not all_item_ids:
+            print("--- [RQ INFO] Nenhum ID coletado na Shopee. ---")
             service._update_sync_status(
-                is_running=False, mensagem=f"Erro Crítico: {str(e)}"
+                is_running=False, mensagem="Nenhum anúncio encontrado na Shopee."
             )
+            return
+
+        # 3. Executa a lógica de sincronização em lotes
+        print(f"--- [RQ START] Iniciando Worker para {len(all_item_ids)} itens ---")
+        service._run_sync_worker_logic(all_item_ids, creds)
+        print(
+            f"--- [RQ FINISH] Sincronização Finalizada: {len(all_item_ids)} itens processados ---"
+        )
+        
+        # 4. Revalidar travas após a sincronização
+        print("--- [RQ JOB] Revalidando travas de atualização ---")
+        service.revalidate_all_locks()
+        
+    except Exception as e:
+        import traceback
+
+        tb = traceback.format_exc()
+        print(f"--- [RQ CRITICAL ERROR] ---\n{tb}")
+        service._update_sync_status(
+            is_running=False, mensagem=f"Erro Crítico: {str(e)}"
+        )
 
 
 def run_unlock_check_job():
-    """Job do RQ para verificar desbloqueios diários."""
-    from app import app
-
-    with app.app_context():
-        service = ShopeeService()
-        print("--- [RQ JOB] Verificando Desbloqueios ---")
-        service.verificar_todos_desbloqueios()
-        print("--- [RQ JOB] Verificação Finalizada ---")
+    """Job do RQ para verificar desbloqueios diários.
+    
+    NOTA: O RQ Worker já empurra um app_context().
+    """
+    service = ShopeeService()
+    print("--- [RQ JOB] Verificando Desbloqueios ---")
+    service.verificar_todos_desbloqueios()
+    print("--- [RQ JOB] Verificação Finalizada ---")

@@ -208,37 +208,43 @@ class TokenShopee:
 
 
 def run_token_refresh_job():
-    """Job do RQ para renovar o token da Shopee automaticamente."""
-    from app import app
+    """Job do RQ para renovar o token da Shopee automaticamente.
+    
+    NOTA: Este job roda dentro do RQ Worker que já empurra um app_context(),
+    portanto NÃO devemos importar 'app' diretamente (isso puxaria eventlet e
+    causaria BlockingIOError). Usamos current_app que já está disponível.
+    """
+    from flask import current_app
     from model.shopeeModel import IntegracaoShopee
     from controller.auth.authShopee import TokenShopee
     from datetime import datetime, timedelta
 
-    with app.app_context():
-        integracao = IntegracaoShopee.query.first()
-        if not integracao:
-            print("--- [RQ TOKEN] Nenhuma integração encontrada para renovar. ---")
+    # O worker já empurrou o app_context, então current_app está disponível.
+    # Não precisamos de 'with app.app_context():' aqui.
+    integracao = IntegracaoShopee.query.first()
+    if not integracao:
+        print("--- [RQ TOKEN] Nenhuma integração encontrada para renovar. ---")
+        return
+
+    # Verifica se realmente precisa renovar (evita renovações duplicadas se o job rodar colado com outro)
+    agora = datetime.utcnow()
+    if integracao.last_access_update_at:
+        tempo_desde_update = agora - integracao.last_access_update_at
+        if tempo_desde_update < timedelta(hours=3, minutes=45):
+            print(
+                f"--- [RQ TOKEN] Token ainda é recente ({tempo_desde_update}). Pulando renovação. ---"
+            )
             return
 
-        # Verifica se realmente precisa renovar (evita renovações duplicadas se o job rodar colado com outro)
-        agora = datetime.utcnow()
-        if integracao.last_access_update_at:
-            tempo_desde_update = agora - integracao.last_access_update_at
-            if tempo_desde_update < timedelta(hours=3, minutes=45):
-                print(
-                    f"--- [RQ TOKEN] Token ainda é recente ({tempo_desde_update}). Pulando renovação. ---"
-                )
-                return
+    print(
+        f"--- [RQ TOKEN] Iniciando renovação automática para: {integracao.name} ---"
+    )
+    tokens = TokenShopee()
+    creds, erro = tokens._refresh_token(integracao)
 
+    if erro:
+        print(f"--- [RQ TOKEN ERROR] Falha ao renovar: {erro} ---")
+    else:
         print(
-            f"--- [RQ TOKEN] Iniciando renovação automática para: {integracao.name} ---"
+            f"--- [RQ TOKEN SUCCESS] Token renovado com sucesso às {datetime.now()} ---"
         )
-        tokens = TokenShopee()
-        creds, erro = tokens._refresh_token(integracao)
-
-        if erro:
-            print(f"--- [RQ TOKEN ERROR] Falha ao renovar: {erro} ---")
-        else:
-            print(
-                f"--- [RQ TOKEN SUCCESS] Token renovado com sucesso às {datetime.now()} ---"
-            )

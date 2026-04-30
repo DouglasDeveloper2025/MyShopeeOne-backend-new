@@ -243,24 +243,22 @@ def _format_announcement(a: Anuncios, dias_espera: int = 0):
             if dias_passados < dias_espera:
                 dias_faltantes = dias_espera - dias_passados
 
-        # --- Precificação Automática de Combos (REFINADA) ---
+        # --- Precificação Automática de COMBOS ---
         suggested_price = None
+        import re
+        combo_detected = False
+
         if sku_clean:
-            import re
-
-            # Padrões comuns: -C2, -KIT2, -V2, -COMBO2, ou espaço C2
-            match = re.search(r"[- ]?(C|KIT|V|COMBO|P)(\d+)$", sku_clean, re.IGNORECASE)
-            if match:
+            # === MÉTODO 1: Combo por sufixo -C{N} no final do SKU ===
+            # Ex: ABC-C2, ABC-C3 → base = ABC, busca no banco
+            end_match = re.search(r"[- ]C(\d+)$", sku_clean, re.IGNORECASE)
+            if end_match:
                 try:
-                    n = int(match.group(2))
+                    n = int(end_match.group(1))
                     if n >= 2:
-                        # Extrair SKU base removendo o sufixo (ex: ABC-C2 -> ABC)
-                        base_sku = sku_clean[: match.start()].strip()
-
-                        # Tentar variações do SKU base de forma mais flexível
+                        base_sku = sku_clean[:end_match.start()].strip()
                         from model.shopeeModel import Produtos
 
-                        # 1. Tenta correspondência exata ou sufixos comuns (Prioridade alta)
                         base_prod = Produtos.query.filter(
                             (Produtos.sku == base_sku)
                             | (Produtos.sku == base_sku + "-C1")
@@ -269,7 +267,6 @@ def _format_announcement(a: Anuncios, dias_espera: int = 0):
                             | (Produtos.sku == base_sku + "-1")
                         ).first()
 
-                        # 2. Se não achou, tenta qualquer um que comece com o base_sku (mas sem ser combo)
                         if not base_prod:
                             base_prod = Produtos.query.filter(
                                 (Produtos.sku.like(f"{base_sku}%"))
@@ -278,22 +275,80 @@ def _format_announcement(a: Anuncios, dias_espera: int = 0):
                             ).first()
 
                         if base_prod:
-                            # Base do cálculo: Prioriza o preço promocional (preço real de venda)
-                            base_calc_price = (
+                            bp = (
                                 base_prod.preco_promocional
                                 if (base_prod.preco_promocional and base_prod.preco_promocional > 0)
                                 else base_prod.preco_base
                             )
-                            # Regra Progressiva: (Preço * Quantidade) * (0.99 ^ (n-1))
-                            calc = (base_calc_price * n) * (0.99 ** (n - 1))
-                            suggested_price = round(calc, 2)
-
-                            # Log para o usuário verificar no terminal (app.py)
-                            # print(f"📦 COMBO DETECTADO: {sku_clean}")
-                            # print(f"   ∟ SKU Base: {base_sku} (Preço: R$ {base_prod.preco_base})")
-                            # print(f"   ∟ Cálculo x{n}: ({base_prod.preco_base} * {n}) - 1% = R$ {suggested_price}")
+                            if bp and bp > 0:
+                                suggested_price = round((bp * n) * (0.99 ** (n - 1)), 2)
+                                combo_detected = True
                 except Exception as e:
-                    print(f"⚠️ Erro ao calcular combo para {sku_clean}: {e}")
+                    print(f"⚠️ Erro combo (sufixo) {sku_clean}: {e}")
+
+            # === MÉTODO 2: Combo por padrão -C{N}-{X} no meio do SKU ===
+            # Ex: LB-02301-C2-1 → base = LB-02301-C1-1, busca irmã + banco
+            if not combo_detected:
+                mid_match = re.search(r"-C(\d+)-", sku_clean, re.IGNORECASE)
+                if mid_match:
+                    try:
+                        n = int(mid_match.group(1))
+                        if n >= 2:
+                            # Substituir apenas o número: C2→C1, C3→C1
+                            base_sku = (
+                                sku_clean[:mid_match.start(1)]
+                                + "1"
+                                + sku_clean[mid_match.end(1):]
+                            )
+                            bp = None
+
+                            # 1. Buscar irmã C1 no MESMO anúncio
+                            for sib in all_variations:
+                                s_sku = str(sib.sku or "").strip()
+                                if str(sib.shopee_model_id or "0") == mid:
+                                    continue
+                                if s_sku == base_sku:
+                                    bp = (
+                                        sib.preco_promocional
+                                        if (sib.preco_promocional and sib.preco_promocional > 0)
+                                        else sib.preco_base
+                                    )
+                                    break
+
+                            # 2. Irmã sem -C no mesmo anúncio (variação unitária)
+                            if not bp:
+                                for sib in all_variations:
+                                    s_sku = str(sib.sku or "").strip()
+                                    if str(sib.shopee_model_id or "0") == mid:
+                                        continue
+                                    if not re.search(r"-C\d+", s_sku, re.IGNORECASE):
+                                        p = (
+                                            sib.preco_promocional
+                                            if (sib.preco_promocional and sib.preco_promocional > 0)
+                                            else sib.preco_base
+                                        )
+                                        if p and p > 0:
+                                            bp = p
+                                            break
+
+                            # 3. Fallback: buscar no banco inteiro
+                            if not bp:
+                                from model.shopeeModel import Produtos
+                                base_prod = Produtos.query.filter(
+                                    Produtos.sku == base_sku
+                                ).first()
+                                if base_prod:
+                                    bp = (
+                                        base_prod.preco_promocional
+                                        if (base_prod.preco_promocional and base_prod.preco_promocional > 0)
+                                        else base_prod.preco_base
+                                    )
+
+                            if bp and bp > 0:
+                                suggested_price = round((bp * n) * (0.99 ** (n - 1)), 2)
+                                combo_detected = True
+                    except Exception as e:
+                        print(f"⚠️ Erro combo (variação) {sku_clean}: {e}")
 
         item_data["variacoes"].append(
             {
