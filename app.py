@@ -1,9 +1,16 @@
 import eventlet
 eventlet.monkey_patch()
 
+# Garante que o psycopg2 seja greened corretamente para evitar erros de SSL
+try:
+    from eventlet.support import psycopg2_patcher
+    psycopg2_patcher.make_psycopg_green()
+except ImportError:
+    pass
+
 import sys
 import os
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from model.shopeeModel import db
 from routes.shopeeRoutes import shopee_bp
@@ -17,7 +24,15 @@ load_dotenv()
 
 app = Flask(__name__, static_folder="frontend/dist", static_url_path="/")
 CORS(app)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
+
+# Ajuste de timeouts para evitar Bad file descriptor no Render
+socketio = SocketIO(
+    app, 
+    cors_allowed_origins="*", 
+    async_mode="eventlet",
+    ping_timeout=60,
+    ping_interval=25
+)
 
 # Configuração do Banco de Dados postgresql
 database_url = os.environ.get("DATABASE_URL")
@@ -49,6 +64,14 @@ app.register_blueprint(user_bp, url_prefix="/api")
 # Cria as tabelas se não existirem
 with app.app_context():
     db.create_all()
+
+# Rota para servir o Frontend (SPA Fallback)
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def serve(path):
+    if path != "" and os.path.exists(os.path.join(app.static_folder, path)):
+        return send_from_directory(app.static_folder, path)
+    return send_from_directory(app.static_folder, 'index.html')
 
 
 def background_checker():
