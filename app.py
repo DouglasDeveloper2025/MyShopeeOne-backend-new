@@ -1,22 +1,8 @@
+import eventlet
+eventlet.monkey_patch()
+
 import sys
 import os
-
-# --- APLICAÇÃO DO MONKEY PATCH (DEVE SER A PRIMEIRA COISA) ---
-# Detectamos se estamos rodando o worker do RQ para EVITAR o monkey_patch.
-# O monkey_patch no worker causa conflitos com o multiprocessing do Python 3.12+.
-is_worker = False
-if len(sys.argv) > 0 and ("worker.py" in sys.argv[0] or "rq" in sys.argv[0]):
-    is_worker = True
-if os.environ.get("IS_RQ_WORKER") == "true":
-    is_worker = True
-
-if not is_worker:
-    try:
-        import eventlet
-        eventlet.monkey_patch()
-    except ImportError:
-        pass
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from model.shopeeModel import db
@@ -44,6 +30,14 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = os.environ.get(
 )
 app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET_KEY")
 
+# Configurações para evitar erros de conexão (SSL/Bad Record MAC) no Render/Eventlet
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+    "pool_pre_ping": True,
+    "pool_recycle": 300,
+    "pool_size": 10,
+    "max_overflow": 20
+}
+
 # Inicializa o DB
 db.init_app(app)
 
@@ -70,20 +64,20 @@ def background_checker():
         try:
             # Pega o horário atual em São Paulo
             now = datetime.now(tz_br)
-            
+
             from model.shopeeModel import IntegracaoShopee, Configuracoes
             from datetime import datetime as dt_utc, timedelta
 
             with app.app_context():
                 config = Configuracoes.query.first()
                 integracao = IntegracaoShopee.query.first()
-                
+
                 # 1. Checagem de Token Shopee
                 if integracao and integracao.last_access_update_at:
                     agora_utc = dt_utc.utcnow()
                     # Busca a configuração de intervalo do banco (ou usa 230 min como fallback)
                     intervalo_min = config.intervalo_refresh_token if config else 230
-                    
+
                     # Se o token tem mais que o intervalo definido, enfileira a renovação
                     if (agora_utc - integracao.last_access_update_at) >= timedelta(
                         minutes=intervalo_min
@@ -118,9 +112,8 @@ def background_checker():
 
 
 # Inicia a checagem em segundo plano de forma assíncrona compatível com eventlet
-# Somente se o eventlet foi carregado (não é worker)
-if not is_worker:
-    import eventlet
+# Somente se NÃO for o worker do RQ (para não duplicar a tarefa de agendamento)
+if "worker.py" not in sys.argv[0] and os.environ.get("IS_RQ_WORKER") != "true":
     eventlet.spawn(background_checker)
 
 if __name__ == "__main__":
