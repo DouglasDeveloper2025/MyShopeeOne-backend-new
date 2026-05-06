@@ -17,13 +17,13 @@ start "FLASK SERVER" cmd /k "call .venv\Scripts\activate && python app.py"
 echo [2/2] Iniciando RQ Worker (Processamento de Filas)...
 start "RQ WORKER" cmd /k "call .venv\Scripts\activate && python config/worker.py"
 
-echo [3/3] Iniciando RQ Dashboard (Monitoramento de Filas)...
-start "RQ DASHBOARD" cmd /k "call .venv\Scripts\activate && rq-dashboard -u rediss://red-d7nlrn1o3t8c73eoqj1g:z1DtWTenuPexEC1QDUv7rASZLeXa9Wcj@virginia-keyvalue.render.com:6379"
+@REM echo [3/3] Iniciando RQ Dashboard (Monitoramento de Filas)...
+@REM start "RQ DASHBOARD" cmd /k "call .venv\Scripts\activate && rq-dashboard -u rediss://red-d7nlrn1o3t8c73eoqj1g:z1DtWTenuPexEC1QDUv7rASZLeXa9Wcj@virginia-keyvalue.render.com:6379"
 
 
 echo.
 echo ====================================================
-echo   TODOS OS SERVICOS FORAM LANÇADOS COM SUCESSO!
+echo   TODOS OS SERVICOS FORAM LANCADOS COM SUCESSO!
 echo   Pode fechar esta janela se desejar.
 echo ====================================================
 pause
