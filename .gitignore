@@ -3,7 +3,7 @@
 /venv
 *__pycache__
 /logs
-/utils
+# /utils
 /arquivos
 .env
 /scratch
@@ -32,7 +32,7 @@ venv/
 /logs/
 /arquivos/
 /scratch/
-/utils/
+# /utils/
 .env
 
 *.zip
