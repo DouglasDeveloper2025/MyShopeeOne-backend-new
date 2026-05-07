@@ -1,10 +1,12 @@
 import eventlet
+
 # Força o patch de forma agressiva para tentar capturar locks residuais
-eventlet.monkey_patch(all=True, thread=True)
+eventlet.monkey_patch()
 
 # Garante que o psycopg2 seja greened corretamente para evitar erros de SSL
 try:
     from eventlet.support import psycopg2_patcher
+
     psycopg2_patcher.make_psycopg_green()
 except ImportError:
     pass
@@ -28,11 +30,11 @@ CORS(app)
 
 # Ajuste de timeouts para evitar Bad file descriptor no Render
 socketio = SocketIO(
-    app, 
-    cors_allowed_origins="*", 
+    app,
+    cors_allowed_origins="*",
     async_mode="eventlet",
     ping_timeout=60,
-    ping_interval=25
+    ping_interval=25,
 )
 
 # Configuração do Banco de Dados postgresql
@@ -51,7 +53,7 @@ app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
     "pool_pre_ping": True,
     "pool_recycle": 300,
     "pool_size": 10,
-    "max_overflow": 20
+    "max_overflow": 20,
 }
 
 # Inicializa o DB
@@ -66,13 +68,14 @@ app.register_blueprint(user_bp, url_prefix="/api")
 with app.app_context():
     db.create_all()
 
+
 # Rota para servir o Frontend (SPA Fallback)
-@app.route('/', defaults={'path': ''})
-@app.route('/<path:path>')
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
 def serve(path):
     if path != "" and os.path.exists(os.path.join(app.static_folder, path)):
         return send_from_directory(app.static_folder, path)
-    return send_from_directory(app.static_folder, 'index.html')
+    return send_from_directory(app.static_folder, "index.html")
 
 
 def background_checker():
@@ -123,10 +126,22 @@ def background_checker():
                         f"[{now.strftime('%d/%m/%Y %H:%M:%S')}] Enfileirando SINCRONIZAÇÃO COMPLETA agendada ({target_h:02d}:{target_m:02d}) no RQ..."
                     )
                     shopee_queue.enqueue(
-                        "controller.shopeeUpdate.shopeeUpdateController.run_full_sync_job"
+                        "controller.shopee_update.shopee_update_controller.run_full_sync_job"
                     )
                     # Dorme por 70 segundos para garantir que saia da janela do minuto atual
                     time.sleep(70)
+
+                # 3. Impulsionamento (Boost) Automático (A cada 1 minuto para manter slots cheios)
+                if now.second < 60:
+                    # O scheduler já dorme 60s no final, então rodará uma vez por minuto
+                    # print(f"[{now.strftime('%H:%M:%S')}] Verificando Slots de BOOST (1 min interval)...")
+                    shopee_queue.enqueue(
+                        "controller.shopee_boost.run_boost_job",
+                        job_id=f"shopee_boost_cycle_{now.strftime('%Y%m%d%H%M')}",
+                    )
+
+                # Limpa a sessão antes de sair do contexto para evitar conexões presas
+                db.session.remove()
 
             # Verifica a cada 1 minuto
             time.sleep(60)

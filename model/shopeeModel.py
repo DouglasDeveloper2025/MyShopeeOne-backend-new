@@ -39,6 +39,7 @@ class Usuario(db.Model):
             "update_price": True,
             "view_history": False,
             "view_promotions": True,
+            "view_boost": True,
             "view_settings": False
         }
         
@@ -71,6 +72,7 @@ class Configuracoes(db.Model):
     hora_sincronizacao = db.Column(db.Integer, default=0)
     minuto_sincronizacao = db.Column(db.Integer, default=15)
     intervalo_refresh_token = db.Column(db.Integer, default=230) # minutos (padrão ~3h50m)
+    boost_mode = db.Column(db.String(20), default="sequential") # 'sequential' ou 'random'
 
 class HistoricoPreco(db.Model):
     """
@@ -160,8 +162,16 @@ class Anuncios(db.Model):
     shopee_item_id = db.Column(db.String(255), unique=True, nullable=False)
     nome = db.Column(db.String(255), index=True, nullable=False)
     sku_pai = db.Column(db.String(255), index=True, nullable=True)
+    status = db.Column(db.String(50), default="NORMAL", index=True)
+    estoque_total = db.Column(db.Integer, default=0)
     created_at = db.Column(db.DateTime, default=get_br_now, nullable=False)
     updated_at = db.Column(db.DateTime, default=get_br_now, nullable=False)
+    
+    # Novos campos para Impulsionamento (Boost)
+    boost_enabled = db.Column(db.Boolean, default=False, index=True)
+    boost_priority = db.Column(db.Boolean, default=False, index=True)
+    last_boost_at = db.Column(db.DateTime, nullable=True)
+    boost_end_at = db.Column(db.DateTime, nullable=True) # Quando o boost atual expira
 
     # Relacionamento com as variações
     variacoes = db.relationship("Produtos", backref="anuncio", lazy=True, cascade="all, delete-orphan")
@@ -172,6 +182,12 @@ class Anuncios(db.Model):
             "shopee_item_id": self.shopee_item_id,
             "nome": self.nome,
             "sku": self.sku_pai,
+            "status": self.status,
+            "estoque": self.estoque_total,
+            "boost_enabled": self.boost_enabled,
+            "boost_priority": self.boost_priority,
+            "last_boost_at": self.last_boost_at.isoformat() if self.last_boost_at else None,
+            "boost_end_at": self.boost_end_at.isoformat() if self.boost_end_at else None,
             "variacoes": [v.to_dict() for v in self.variacoes]
         }
 
@@ -195,6 +211,7 @@ class Produtos(db.Model):
     promotion_id = db.Column(db.String(100), index=True, nullable=True) # Cache do ID de promoção
     ean = db.Column(db.String(100), nullable=True)
     situacao = db.Column(db.String(50), nullable=True) # Ativo ou Inativo
+    estoque = db.Column(db.Integer, default=0)
 
 
     created_at = db.Column(db.DateTime, default=get_br_now, nullable=False)
@@ -220,6 +237,7 @@ class Produtos(db.Model):
             "promotion_id": self.promotion_id,
             "ean": self.ean,
             "situacao": self.situacao,
+            "estoque": self.estoque,
             "preco_modificado_em": self.preco_modificado_em.isoformat() if self.preco_modificado_em else None
         }
 
@@ -238,3 +256,27 @@ class Promocoes(db.Model):
 
     def __repr__(self):
         return f"<Promocao {self.discount_id}: {self.discount_name}>"
+
+class BoostLog(db.Model):
+    """
+    Tabela de logs persistentes para o algoritmo de impulsionamento.
+    """
+    __tablename__ = "boost_logs"
+    id = db.Column(db.Integer, primary_key=True)
+    shopee_item_id = db.Column(db.String(255), nullable=True)
+    nome_produto = db.Column(db.String(255), nullable=True)
+    acao = db.Column(db.String(100), nullable=False) # 'boost_start', 'boost_check', 'slot_free', 'error'
+    status = db.Column(db.String(50), nullable=False) # 'success', 'error', 'info'
+    mensagem = db.Column(db.Text, nullable=True)
+    criado_em = db.Column(db.DateTime, default=get_br_now)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "shopee_item_id": self.shopee_item_id,
+            "nome_produto": self.nome_produto,
+            "acao": self.acao,
+            "status": self.status,
+            "mensagem": self.mensagem,
+            "criado_em": self.criado_em.isoformat() if self.criado_em else None
+        }

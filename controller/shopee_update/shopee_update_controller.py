@@ -381,7 +381,6 @@ class ShopeeService:
 
             # Mapear promos por item_id para busca rápida
             promo_map = {str(p["item_id"]): p.get("promotion", []) for p in promos_all}
-
             for info in items_info:
                 iid = str(info["item_id"])
                 try:
@@ -392,12 +391,17 @@ class ShopeeService:
                             shopee_item_id=iid,
                             nome=info.get("item_name"),
                             sku_pai=info.get("item_sku"),
+                            status=info.get("item_status", "NORMAL"),
                         )
                         db.session.add(anuncio)
                         db.session.flush()
                     else:
                         anuncio.nome = info.get("item_name", anuncio.nome)
                         anuncio.sku_pai = info.get("item_sku", anuncio.sku_pai)
+                        anuncio.status = info.get("item_status", anuncio.status)
+
+                    # Inicializa estoque total (será calculado abaixo)
+                    anuncio.estoque_total = 0
 
                     promos_list = promo_map.get(iid, [])
                     has_model = info.get("has_model", False)
@@ -409,6 +413,7 @@ class ShopeeService:
                         ).delete()
 
                         modelos = self._get_models(iid, creds)
+                        total_stock_acc = 0
                         for m in modelos:
                             mid = str(m.get("model_id"))
                             mid_int = int(m.get("model_id", 0))
@@ -451,6 +456,14 @@ class ShopeeService:
                             prod.situacao = info.get(
                                 "item_status"
                             )  # Status do anúncio pai reflete nas variações
+
+                            # Captura estoque da variação específica
+                            m_stock_v2 = m.get("stock_info_v2", {})
+                            prod.estoque = m_stock_v2.get("summary_info", {}).get(
+                                "total_available_stock", 0
+                            )
+                            total_stock_acc += prod.estoque
+
                             prod.preco_base = p_original
 
                             if promo_v:
@@ -478,6 +491,9 @@ class ShopeeService:
                                 prod.promotion_id = None
 
                             prod.updated_at = agora
+
+                        # Atualiza o estoque total do anúncio com a soma das variações
+                        anuncio.estoque_total = total_stock_acc
                         anuncio.updated_at = agora
 
                         # (Removido daqui pois agora é proativo no início do bloco has_model)
@@ -517,6 +533,15 @@ class ShopeeService:
                             "ean"
                         )  # Captura o EAN/GTIN do anúncio simples
                         prod.situacao = info.get("item_status")
+
+                        # Captura estoque (item simples)
+                        s_stock_v2 = info.get("stock_info_v2", {})
+                        prod.estoque = s_stock_v2.get("summary_info", {}).get(
+                            "total_available_stock", 0
+                        )
+                        # No item simples, o estoque total do anúncio é o estoque do produto "0"
+                        anuncio.estoque_total = prod.estoque
+
                         prod.preco_base = p_original
                         if promo_v:
                             v_promo = (
@@ -758,7 +783,6 @@ class ShopeeService:
                 return {"status": "erro", "mensagem": erro}
 
             res = self.sync_batch_from_shopee([item_id], creds)
-
             if res.get("sucessos", 0) > 0:
                 return {"status": "sucesso"}
             return {"status": "erro", "mensagem": "Falha na sincronização do item."}
@@ -1111,7 +1135,7 @@ class ShopeeService:
                             return {
                                 "status": "erro",
                                 "mensagem": f"A campanha automática atingiu o limite de anúncios ({count_promo}/1000). Remova itens ou crie uma nova na Shopee.",
-                            }, 400
+                            }
                 else:
                     # --- NOVO: Validação de Segurança (Preço Base) ---
                     try:
@@ -1131,7 +1155,7 @@ class ShopeeService:
                             item_id=str(item_id),
                             model_id=str(mid_atual),
                         )
-                        return {"status": "erro", "mensagem": lock_msg}, 403
+                        return {"status": "erro", "mensagem": lock_msg}
 
                     resp, code = self._update_base_price(
                         item_id,
@@ -1161,7 +1185,7 @@ class ShopeeService:
                         if force_promotion:
                             log_msg = "Anuncio colocado em promoção"
                         elif promocao:
-                            log_msg = "Anuncio em Promoção"
+                            log_msg = "Preço de Promoção Atualizado"
                         else:
                             log_msg = "Atualizado"
 
@@ -2392,7 +2416,12 @@ class ShopeeService:
             return {"status": "erro", "mensagem": str(e)}, 500
 
     def add_discount_item(
-        self, creds, discount_id, items, log_msg="Anuncio em Promoção", origem=None
+        self,
+        creds,
+        discount_id,
+        items,
+        log_msg="Preço de Promoção Atualizado",
+        origem=None,
     ):
         """
         Adiciona itens a uma promoção existente e atualiza o Banco Local.

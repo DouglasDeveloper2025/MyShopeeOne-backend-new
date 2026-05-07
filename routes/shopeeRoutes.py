@@ -6,10 +6,22 @@ import io
 import re
 import requests
 from sqlalchemy.orm import joinedload, selectinload
-from controller.shopeeUpdate.shopeeUpdateController import ShopeeService
+from controller.shopee_update.shopee_update_controller import ShopeeService
+from controller.shopee_boost import BoostController
 from controller.auth.authShopee import TokenShopee
-from model.shopeeModel import db, IntegracaoShopee, Anuncios, Produtos
-from middleware.authMiddleware import token_required, admin_required, permission_required
+from model.shopeeModel import (
+    db,
+    IntegracaoShopee,
+    Anuncios,
+    Produtos,
+    BoostLog,
+    Configuracoes,
+)
+from middleware.authMiddleware import (
+    token_required,
+    admin_required,
+    permission_required,
+)
 
 # Criação do Blueprint para as rotas da Shopee
 shopee_bp = Blueprint("shopee", __name__)
@@ -135,7 +147,11 @@ def get_integration_status():
         }
 
         # APENAS Admins podem ver o Token de Acesso real por segurança
-        if hasattr(g, "current_user") and g.current_user and g.current_user.role == "admin":
+        if (
+            hasattr(g, "current_user")
+            and g.current_user
+            and g.current_user.role == "admin"
+        ):
             response_data["access_token"] = integracao.last_access_token
 
         return jsonify(response_data), 200
@@ -151,22 +167,336 @@ def manual_refresh_token():
     try:
         integracao = IntegracaoShopee.query.first()
         if not integracao:
-            return jsonify({"status": "erro", "mensagem": "Nenhuma integração encontrada"}), 404
-        
+            return (
+                jsonify(
+                    {"status": "erro", "mensagem": "Nenhuma integração encontrada"}
+                ),
+                404,
+            )
+
         resultado, erro = auth_shopee._refresh_token(integracao)
         if erro:
             return jsonify({"status": "erro", "mensagem": erro}), 400
-        
-        return jsonify({
-            "status": "sucesso", 
-            "mensagem": "Token renovado com sucesso!",
-            "expires_at": (
-                integracao.last_access_update_at 
-                + timedelta(seconds=integracao.expire_in)
-            ).strftime("%Y-%m-%dT%H:%M:%SZ")
-        }), 200
+
+        return (
+            jsonify(
+                {
+                    "status": "sucesso",
+                    "mensagem": "Token renovado com sucesso!",
+                    "expires_at": (
+                        integracao.last_access_update_at
+                        + timedelta(seconds=integracao.expire_in)
+                    ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                }
+            ),
+            200,
+        )
     except Exception as e:
         return jsonify({"status": "erro", "mensagem": str(e)}), 500
+
+
+# --- Rotas de Impulsionamento (Boost) ---
+
+
+@shopee_bp.route("/boost/status", methods=["GET"])
+@token_required
+@permission_required("view_boost")
+def get_boost_status():
+    """Retorna o status geral do impulsionamento e produtos ativos."""
+    try:
+        import logging
+
+        logger = logging.getLogger(__name__)
+        logger.info("Iniciando get_boost_status")
+
+        controller = BoostController()
+        logger.info("Controller inicializado")
+
+        resp = controller.client.get_boosted_list()
+        logger.info(
+            f"Resposta do get_boosted_list recebida: {resp.get('error') if resp else 'None'}"
+        )
+
+        active_boosts = []
+        if not resp.get("error"):
+            active_boosts = resp.get("response", {}).get("item_list", [])
+
+        config = Configuracoes.query.first()
+        boost_mode = config.boost_mode if config else "sequential"
+
+        # Busca logs recentes
+        logs = BoostLog.query.order_by(BoostLog.criado_em.desc()).limit(20).all()
+
+        # Busca produtos configurados para boost (Apenas Ativos e COM ESTOQUE MINIMO >= 3)
+        enabled_count = (
+            Anuncios.query.filter(Anuncios.status.in_(["NORMAL", "ATIVO"]))
+            .filter(Anuncios.estoque_total >= 3)
+            .count()
+        )
+        priority_count = (
+            Anuncios.query.filter(Anuncios.status.in_(["NORMAL", "ATIVO"]))
+            .filter(Anuncios.estoque_total >= 3)
+            .filter_by(boost_priority=True)
+            .count()
+        )
+
+        # Busca próximos da fila (50 slots futuros)
+        next_boosts = controller.get_next_boosts(limit=50)
+
+        # Enriquecer active_boosts com dados locais (Nome e SKU)
+        enriched_active = []
+        for ab in active_boosts:
+            item_id = str(ab.get("item_id"))
+            local_item = Anuncios.query.filter_by(shopee_item_id=item_id).first()
+            enriched_active.append(
+                {
+                    "item_id": item_id,
+                    "cool_down_second": ab.get("cool_down_second"),
+                    "nome": local_item.nome if local_item else "Desconhecido",
+                    "sku": local_item.sku_pai if local_item else "N/A",
+                }
+            )
+
+        return jsonify(
+            {
+                "active_boosts": enriched_active,
+                "enabled_count": enabled_count,
+                "priority_count": priority_count,
+                "boost_mode": boost_mode,
+                "next_boosts": [
+                    {
+                        "shopee_item_id": a.shopee_item_id,
+                        "nome": a.nome,
+                        "sku": a.sku_pai or "",
+                        "boost_priority": a.boost_priority,
+                    }
+                    for a in next_boosts
+                ],
+                "logs": [l.to_dict() for l in logs],
+            }
+        )
+    except Exception as e:
+        import logging
+
+        logging.getLogger(__name__).error(f"Erro em get_boost_status: {e}")
+        return jsonify({"mensagem": f"Erro interno: {str(e)}"}), 500
+
+
+@shopee_bp.route("/boost/toggle", methods=["POST"])
+@token_required
+@permission_required("view_boost")
+def toggle_boost():
+    """Ativa ou desativa o impulsionamento automático para um item."""
+    data = request.json
+    item_id = data.get("itemId")
+    enabled = data.get("enabled", False)
+
+    if not item_id:
+        return jsonify({"mensagem": "ItemID não fornecido"}), 400
+
+    anuncio = Anuncios.query.filter_by(shopee_item_id=str(item_id)).first()
+    if not anuncio:
+        return jsonify({"mensagem": "Anúncio não encontrado"}), 404
+
+    anuncio.boost_enabled = enabled
+    db.session.commit()
+
+    status_msg = "ativado" if enabled else "desativado"
+    return jsonify(
+        {"mensagem": f"Impulsionamento automático {status_msg} para {anuncio.nome}"}
+    )
+
+
+@shopee_bp.route("/boost/priority", methods=["POST"])
+@token_required
+@permission_required("view_boost")
+def toggle_boost_priority():
+    """Define a prioridade de um item para o impulsionamento."""
+    data = request.json
+    item_id = data.get("itemId")
+    priority = data.get("priority", False)
+
+    anuncio = Anuncios.query.filter_by(shopee_item_id=str(item_id)).first()
+    if not anuncio:
+        return jsonify({"mensagem": "Anúncio não encontrado"}), 404
+
+    anuncio.boost_priority = priority
+    db.session.commit()
+    return jsonify(
+        {
+            "mensagem": f"Prioridade {'ativada' if priority else 'desativada'} para {anuncio.nome}"
+        }
+    )
+
+
+@shopee_bp.route("/boost/mode", methods=["POST"])
+@token_required
+@permission_required("view_boost")
+def update_boost_mode():
+    """Altera o modo de seleção do impulsionamento (sequential/random)."""
+    data = request.json
+    mode = data.get("mode")
+    if mode not in ["sequential", "random"]:
+        return jsonify({"mensagem": "Modo inválido"}), 400
+
+    config = Configuracoes.query.first()
+    if not config:
+        config = Configuracoes()
+        db.session.add(config)
+
+    config.boost_mode = mode
+    db.session.commit()
+    return jsonify({"mensagem": f"Modo de impulsionamento alterado para {mode}"})
+
+
+@shopee_bp.route("/boost/manual", methods=["POST"])
+@token_required
+@permission_required("view_boost")
+def manual_boost():
+    """Impulsiona um item manualmente via API da Shopee."""
+    data = request.json
+    item_id = data.get("itemId")
+
+    # Verifica se o item existe e tem estoque
+    anuncio = Anuncios.query.filter_by(shopee_item_id=str(item_id)).first()
+    if anuncio and anuncio.estoque_total <= 0:
+        return (
+            jsonify(
+                {
+                    "status": "erro",
+                    "mensagem": "Falha ao impulsionar: O anúncio está sem estoque (Stock 0).",
+                }
+            ),
+            400,
+        )
+    if anuncio and anuncio.status not in ["NORMAL", "ATIVO"]:
+        return (
+            jsonify(
+                {
+                    "status": "erro",
+                    "mensagem": f"Falha ao impulsionar: Status do anúncio é {anuncio.status}.",
+                }
+            ),
+            400,
+        )
+
+    controller = BoostController()
+    resp = controller.client.boost_item(item_id)
+
+    if resp.get("error") and resp.get("error") != "":
+        msg = resp.get("message") or resp.get("error")
+        import logging
+
+        logging.getLogger(__name__).error(
+            f"Erro no Impulso Manual (Item {item_id}): {resp}"
+        )
+        return (
+            jsonify({"status": "erro", "mensagem": f"Falha ao impulsionar: {msg}"}),
+            400,
+        )
+
+    # Atualiza no banco que foi impulsionado
+    anuncio = Anuncios.query.filter_by(shopee_item_id=str(item_id)).first()
+    if anuncio:
+        from controller.shopee_boost import get_br_now
+
+        anuncio.last_boost_at = get_br_now()
+        anuncio.boost_end_at = get_br_now() + timedelta(hours=4)
+        db.session.commit()
+
+    return jsonify(
+        {"status": "sucesso", "mensagem": "Produto impulsionado com sucesso na Shopee!"}
+    )
+
+
+@shopee_bp.route("/boost/run-now", methods=["POST"])
+@token_required
+@permission_required("view_boost")
+def run_boost_now():
+    """Dispara o ciclo de impulsionamento imediatamente."""
+    try:
+        from controller.shopee_boost import BoostController
+
+        controller = BoostController()
+        result = controller.run_boost_cycle()
+        return jsonify({"status": "sucesso", "mensagem": f"Ciclo executado: {result}"})
+    except Exception as e:
+        return (
+            jsonify(
+                {"status": "erro", "mensagem": f"Erro ao executar ciclo: {str(e)}"}
+            ),
+            500,
+        )
+
+
+@shopee_bp.route("/boost/announcements", methods=["GET"])
+@token_required
+@permission_required("view_boost")
+def get_boost_announcements():
+    """Retorna a lista de anúncios para o dashboard de boost com paginação."""
+    page = request.args.get("page", 1, type=int)
+    per_page = request.args.get("per_page", 10, type=int)
+    search = request.args.get("search", "")
+    show_all = request.args.get("showAll", "false").lower() == "true"
+
+    query = Anuncios.query.filter(Anuncios.status.in_(["NORMAL", "ATIVO"])).filter(
+        Anuncios.estoque_total >= 3
+    )
+
+    # Se show_all for falso (padrão), removemos quem está com boost ativo
+    if not show_all:
+        query = query.filter(Anuncios.boost_end_at == None)
+    if search:
+        query = query.filter(
+            Anuncios.nome.ilike(f"%{search}%")
+            | Anuncios.shopee_item_id.ilike(f"%{search}%")
+            | Anuncios.sku_pai.ilike(f"%{search}%")
+        )
+
+    # Ordenar por prioridade e depois por nome
+    pagination = query.order_by(
+        Anuncios.boost_priority.desc(), Anuncios.nome.asc()
+    ).paginate(page=page, per_page=per_page, error_out=False)
+
+    return jsonify(
+        {
+            "items": [
+                {
+                    "id": a.id,
+                    "shopee_item_id": a.shopee_item_id,
+                    "nome": a.nome,
+                    "sku": a.sku_pai,
+                    "boost_enabled": a.boost_enabled,
+                    "boost_priority": a.boost_priority,
+                    "last_boost_at": (
+                        a.last_boost_at.isoformat() if a.last_boost_at else None
+                    ),
+                }
+                for a in pagination.items
+            ],
+            "total": pagination.total,
+            "pages": pagination.pages,
+            "current_page": pagination.page,
+        }
+    )
+
+
+@shopee_bp.route("/boost/logs", methods=["GET"])
+@token_required
+@permission_required("view_boost")
+def get_boost_logs():
+    """Retorna o histórico de logs de boost filtrado por impulsos ou erros."""
+    from sqlalchemy import or_
+
+    logs = (
+        BoostLog.query.filter(
+            BoostLog.acao.in_(["boost_start", "boost_error"])
+        )
+        .order_by(BoostLog.criado_em.desc())
+        .limit(200)
+        .all()
+    )
+    return jsonify([l.to_dict() for l in logs])
 
 
 def _format_announcement(a: Anuncios, dias_espera: int = 0):
@@ -178,6 +508,7 @@ def _format_announcement(a: Anuncios, dias_espera: int = 0):
         "itemId": a.shopee_item_id,
         "title": a.nome,
         "skuPai": a.sku_pai,
+        "status": a.status or "NORMAL",
         "updatedAt": (
             a.updated_at.strftime("%d/%m/%Y %H:%M:%S")
             if getattr(a, "updated_at", None)
@@ -246,6 +577,7 @@ def _format_announcement(a: Anuncios, dias_espera: int = 0):
         # --- Precificação Automática de COMBOS ---
         suggested_price = None
         import re
+
         combo_detected = False
 
         if sku_clean:
@@ -256,7 +588,7 @@ def _format_announcement(a: Anuncios, dias_espera: int = 0):
                 try:
                     n = int(end_match.group(1))
                     if n >= 2:
-                        base_sku = sku_clean[:end_match.start()].strip()
+                        base_sku = sku_clean[: end_match.start()].strip()
                         from model.shopeeModel import Produtos
 
                         base_prod = Produtos.query.filter(
@@ -277,7 +609,10 @@ def _format_announcement(a: Anuncios, dias_espera: int = 0):
                         if base_prod:
                             bp = (
                                 base_prod.preco_promocional
-                                if (base_prod.preco_promocional and base_prod.preco_promocional > 0)
+                                if (
+                                    base_prod.preco_promocional
+                                    and base_prod.preco_promocional > 0
+                                )
                                 else base_prod.preco_base
                             )
                             if bp and bp > 0:
@@ -296,9 +631,9 @@ def _format_announcement(a: Anuncios, dias_espera: int = 0):
                         if n >= 2:
                             # Substituir apenas o número: C2→C1, C3→C1
                             base_sku = (
-                                sku_clean[:mid_match.start(1)]
+                                sku_clean[: mid_match.start(1)]
                                 + "1"
-                                + sku_clean[mid_match.end(1):]
+                                + sku_clean[mid_match.end(1) :]
                             )
                             bp = None
 
@@ -310,7 +645,10 @@ def _format_announcement(a: Anuncios, dias_espera: int = 0):
                                 if s_sku == base_sku:
                                     bp = (
                                         sib.preco_promocional
-                                        if (sib.preco_promocional and sib.preco_promocional > 0)
+                                        if (
+                                            sib.preco_promocional
+                                            and sib.preco_promocional > 0
+                                        )
                                         else sib.preco_base
                                     )
                                     break
@@ -322,25 +660,32 @@ def _format_announcement(a: Anuncios, dias_espera: int = 0):
                                     if str(sib.shopee_model_id or "0") == mid:
                                         continue
                                     if not re.search(r"-C\d+", s_sku, re.IGNORECASE):
-                                        p = (
+                                        sib_p = (
                                             sib.preco_promocional
-                                            if (sib.preco_promocional and sib.preco_promocional > 0)
+                                            if (
+                                                sib.preco_promocional
+                                                and sib.preco_promocional > 0
+                                            )
                                             else sib.preco_base
                                         )
-                                        if p and p > 0:
-                                            bp = p
+                                        if sib_p and sib_p > 0:
+                                            bp = sib_p
                                             break
 
                             # 3. Fallback: buscar no banco inteiro
                             if not bp:
                                 from model.shopeeModel import Produtos
+
                                 base_prod = Produtos.query.filter(
                                     Produtos.sku == base_sku
                                 ).first()
                                 if base_prod:
                                     bp = (
                                         base_prod.preco_promocional
-                                        if (base_prod.preco_promocional and base_prod.preco_promocional > 0)
+                                        if (
+                                            base_prod.preco_promocional
+                                            and base_prod.preco_promocional > 0
+                                        )
                                         else base_prod.preco_base
                                     )
 
@@ -398,18 +743,24 @@ def _format_announcement(a: Anuncios, dias_espera: int = 0):
 @permission_required("update_price")
 def sync_all_announcements():
     from config.redis_config import shopee_queue
+
     # Enfileira o trabalho no RQ com um timeout de 1 hora (3600 segundos)
     # já que sincronizações grandes podem demorar bastante.
     job = shopee_queue.enqueue(
-        'controller.shopeeUpdate.shopeeUpdateController.run_full_sync_job',
-        job_timeout=3600 
+        "controller.shopee_update.shopee_update_controller.run_full_sync_job",
+        job_timeout=3600,
     )
-    
-    return jsonify({
-        "status": "sucesso", 
-        "mensagem": "Sincronização total enfileirada com sucesso.",
-        "job_id": job.id
-    }), 200
+
+    return (
+        jsonify(
+            {
+                "status": "sucesso",
+                "mensagem": "Sincronização total enfileirada com sucesso.",
+                "job_id": job.id,
+            }
+        ),
+        200,
+    )
 
 
 @shopee_bp.route("/shopee/sync-progress", methods=["GET"])
@@ -489,6 +840,11 @@ def get_announcements():
         sort_field = request.args.get("sort", "updated_at", type=str)
         sort_order = request.args.get("order", "desc", type=str)
 
+        # Limpar busca
+        search = search.strip()
+        search_str = f"%{search}%" if search else None
+
+        # Base query com carregamento de variações
         query = Anuncios.query.options(selectinload(Anuncios.variacoes))
 
         from model.shopeeModel import Configuracoes, Produtos
@@ -496,74 +852,74 @@ def get_announcements():
         config = Configuracoes.query.first()
         dias_espera = config.dias_espera_simples if config else 15
 
+        # 1. Aplicar Joins Necessários (Apenas uma vez)
+        # Se houver busca ou filtros que dependam de Produtos, fazemos o join agora
+        needs_products_join = bool(search) or filter_type in ["active", "inactive", "locked"]
+        
+        if needs_products_join:
+            # Usamos outerjoin para busca para não excluir anúncios sem variações que batem no nome
+            # Mas se for filtro de status (active/inactive), o join interno é mais apropriado.
+            # Para simplificar e manter a busca funcional, usamos outerjoin e controlamos no filter.
+            query = query.outerjoin(Anuncios.variacoes)
+
+        # 2. Construir Filtros
+        filters = []
+
         if search:
-            search_str = f"%{search}%"
-            # Outerjoin (LEFT JOIN) para garantir visibilidade mesmo se filtros de variação forem estritos
-            query = (
-                query.outerjoin(Anuncios.variacoes)
-                .filter(
-                    (Anuncios.nome.ilike(search_str))
-                    | (
-                        Anuncios.shopee_item_id == search
-                    )  # Busca exata por ID para performance
-                    | (Anuncios.shopee_item_id.ilike(search_str))
-                    | (Anuncios.sku_pai.ilike(search_str))
-                    | (Produtos.sku.ilike(search_str))
-                    | (Produtos.ean.ilike(search_str)) # Busca por EAN
-                    | (Produtos.nome_variacao.ilike(search_str))
-                )
-                .distinct()
-            )
+            search_filters = [
+                Anuncios.nome.ilike(search_str),
+                Anuncios.sku_pai.ilike(search_str),
+                Anuncios.shopee_item_id.ilike(search_str)
+            ]
+            
+            # Adiciona filtros de variação se o join existir
+            if needs_products_join:
+                search_filters.extend([
+                    Produtos.sku.ilike(search_str),
+                    Produtos.ean.ilike(search_str),
+                    Produtos.nome_variacao.ilike(search_str)
+                ])
+                
+            filters.append(or_(*search_filters))
 
         if filter_type == "locked":
             from datetime import datetime, timedelta
             import pytz
-
-            # Usa preco_modificado_em para identificar alterações de preço base recentes (trava da Shopee)
-            agora_br = datetime.now(pytz.timezone("America/Sao_Paulo")).replace(
-                tzinfo=None
-            )
+            agora_br = datetime.now(pytz.timezone("America/Sao_Paulo")).replace(tzinfo=None)
             limite = agora_br - timedelta(days=dias_espera)
-            if not search:
-                query = query.join(Anuncios.variacoes)
-            query = query.filter(Produtos.preco_modificado_em > limite).distinct()
+            filters.append(Produtos.preco_modificado_em > limite)
+            
         elif filter_type == "promo":
-            # Anúncios em promoção (pelo menos uma variação com ID de promoção)
-            subq = (
-                db.session.query(Produtos.shopee_item_id)
-                .filter((Produtos.promotion_id != None) & (Produtos.promotion_id != ""))
-                .distinct()
-                .subquery()
-            )
-            query = query.filter(Anuncios.shopee_item_id.in_(subq))
-        elif filter_type == "no-promo" or filter_type == "available":
-            # Anúncios sem promoção / Disponíveis (nenhuma variação com ID de promoção)
-            subq = (
-                db.session.query(Produtos.shopee_item_id)
-                .filter((Produtos.promotion_id != None) & (Produtos.promotion_id != ""))
-                .distinct()
-                .subquery()
-            )
-            query = query.filter(~Anuncios.shopee_item_id.in_(subq))
+            subq = db.session.query(Produtos.shopee_item_id).filter(
+                (Produtos.promotion_id != None) & (Produtos.promotion_id != "")
+            ).distinct().subquery()
+            filters.append(Anuncios.shopee_item_id.in_(subq))
+            
+        elif filter_type in ["no-promo", "available"]:
+            subq = db.session.query(Produtos.shopee_item_id).filter(
+                (Produtos.promotion_id != None) & (Produtos.promotion_id != "")
+            ).distinct().subquery()
+            filters.append(~Anuncios.shopee_item_id.in_(subq))
+            
         elif filter_type == "active":
-            # Filtro por anúncios ativos (NORMAL)
-            query = query.join(Anuncios.variacoes).filter(Produtos.situacao == "NORMAL").distinct()
+            filters.append(Produtos.situacao == "NORMAL")
+            
         elif filter_type == "inactive":
-            # Filtro por anúncios inativos (qualquer coisa diferente de NORMAL, ex: UNLIST)
-            query = query.join(Anuncios.variacoes).filter(Produtos.situacao != "NORMAL").distinct()
+            filters.append(Produtos.situacao != "NORMAL")
 
-        # Ordenação Dinâmica
+        # Aplicar todos os filtros acumulados
+        if filters:
+            query = query.filter(*filters).distinct()
+
+        # 3. Ordenação Dinâmica
         col = Anuncios.nome if sort_field == "title" else Anuncios.updated_at
         if sort_order == "asc":
             query = query.order_by(col.asc())
         else:
             query = query.order_by(col.desc())
+
+        # 4. Executar Paginação
         pagination = query.paginate(page=page, per_page=per_page, error_out=False)
-
-        from model.shopeeModel import Configuracoes
-
-        config = Configuracoes.query.first()
-        dias_espera = config.dias_espera_simples if config else 15
 
         lista_final = []
         for a in pagination.items:
@@ -783,14 +1139,23 @@ def update_price_api():
                     return jsonify({"status": "erro", "mensagem": lock_msg}), 403
 
         # Suporte para lista de preços (Lote)
-        user_id = getattr(g, "current_user", None).id if getattr(g, "current_user", None) else None
+        user_id = (
+            getattr(g, "current_user", None).id
+            if getattr(g, "current_user", None)
+            else None
+        )
         custom_msg = dados.get("mensagem")
         force_promo = dados.get("forcePromotion", False)
         origem = dados.get("origem")
-        
+
         if price_list and isinstance(price_list, list):
             resultado = shopee_service.alterar_precos_lote(
-                item_id, price_list, user_id=user_id, custom_msg=custom_msg, force_promotion=force_promo, origem=origem
+                item_id,
+                price_list,
+                user_id=user_id,
+                custom_msg=custom_msg,
+                force_promotion=force_promo,
+                origem=origem,
             )
             status_code = 200
         else:
@@ -942,21 +1307,22 @@ def update_config():
         if dias is not None:
             config.dias_espera_simples = int(dias)
             db.session.commit()
-            
+
             # Gatilho: Revalidar as travas IMEDIATAMENTE
-            from controller.shopeeUpdate.shopeeUpdateController import ShopeeService
+            from controller.shopee_update.shopee_update_controller import ShopeeService
+
             service = ShopeeService()
             service.revalidate_all_locks()
 
         # Novos campos de horário
         hora = dados.get("hora_sincronizacao")
         minuto = dados.get("minuto_sincronizacao")
-        
+
         if hora is not None:
             config.hora_sincronizacao = int(hora)
         if minuto is not None:
             config.minuto_sincronizacao = int(minuto)
-            
+
         # Novo campo de intervalo de token
         intervalo = dados.get("intervalo_refresh_token")
         if intervalo is not None:
@@ -964,7 +1330,12 @@ def update_config():
 
         db.session.commit()
         return (
-            jsonify({"status": "sucesso", "mensagem": "Configurações atualizadas e travas revalidadas!"}),
+            jsonify(
+                {
+                    "status": "sucesso",
+                    "mensagem": "Configurações atualizadas e travas revalidadas!",
+                }
+            ),
             200,
         )
     except Exception as e:
@@ -1208,7 +1579,12 @@ def get_discount_items(discount_id):
         force_sync = request.args.get("sync", "false").lower() == "true"
 
         res = shopee_service.get_discount_item_list(
-            creds, discount_id, page=page, page_size=page_size, search=search, force_sync=force_sync
+            creds,
+            discount_id,
+            page=page,
+            page_size=page_size,
+            search=search,
+            force_sync=force_sync,
         )
         return jsonify(res), 200
     except Exception as e:
@@ -1230,7 +1606,9 @@ def add_discount_items_route(discount_id):
             return jsonify({"status": "erro", "mensagem": erro}), 401
 
         origem = dados.get("origem", "Promocoes")
-        res, code = shopee_service.add_discount_item(creds, discount_id, items, origem=origem)
+        res, code = shopee_service.add_discount_item(
+            creds, discount_id, items, origem=origem
+        )
         return jsonify(res), code
     except Exception as e:
         return jsonify({"status": "erro", "mensagem": str(e)}), 500
@@ -1259,6 +1637,7 @@ def delete_discount_item_route(discount_id, item_id, model_id):
 def get_item_info(item_id):
     """Retorna informações de um item específico do banco local."""
     from model.shopeeModel import Anuncios
+
     try:
         anuncio = Anuncios.query.filter_by(shopee_item_id=item_id).first()
         if not anuncio:
@@ -1284,7 +1663,7 @@ def auto_promote_route():
             return jsonify({"status": "erro", "mensagem": erro}), 401
 
         res, code = shopee_service.auto_promote_item(creds, item_id, model_id)
-        
+
         return jsonify(res), code
     except Exception as e:
         return jsonify({"status": "erro", "mensagem": str(e)}), 500
@@ -1295,9 +1674,14 @@ def auto_promote_route():
 def get_notifications():
     """Retorna as notificações do sistema."""
     from model.shopeeModel import NotificacaoSistema
+
     try:
         # Pega as últimas 50 notificações
-        notifs = NotificacaoSistema.query.order_by(NotificacaoSistema.criado_em.desc()).limit(50).all()
+        notifs = (
+            NotificacaoSistema.query.order_by(NotificacaoSistema.criado_em.desc())
+            .limit(50)
+            .all()
+        )
         return jsonify([n.to_dict() for n in notifs]), 200
     except Exception as e:
         return jsonify({"status": "erro", "mensagem": str(e)}), 500
@@ -1308,8 +1692,11 @@ def get_notifications():
 def mark_all_notifications_as_read():
     """Marca todas as notificações como lidas."""
     from model.shopeeModel import NotificacaoSistema
+
     try:
-        NotificacaoSistema.query.filter_by(lida=False).update({NotificacaoSistema.lida: True})
+        NotificacaoSistema.query.filter_by(lida=False).update(
+            {NotificacaoSistema.lida: True}
+        )
         db.session.commit()
         return jsonify({"status": "sucesso"}), 200
     except Exception as e:
@@ -1321,6 +1708,7 @@ def mark_all_notifications_as_read():
 def mark_notification_as_read(id):
     """Marca uma notificação específica como lida."""
     from model.shopeeModel import NotificacaoSistema
+
     try:
         n = NotificacaoSistema.query.get(id)
         if n:

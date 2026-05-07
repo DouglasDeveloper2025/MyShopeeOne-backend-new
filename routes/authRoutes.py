@@ -2,7 +2,7 @@ from flask import Blueprint, request, jsonify, render_template
 import pandas as pd
 import io
 from model.shopeeModel import db, HistoricoPreco, IntegracaoShopee, Produtos
-from controller.shopeeUpdate.shopeeUpdateController import ShopeeService
+from controller.shopee_update.shopee_update_controller import ShopeeService
 from controller.auth.authShopee import TokenShopee
 
 auth_bp = Blueprint("auth", __name__)
