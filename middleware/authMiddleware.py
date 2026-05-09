@@ -70,7 +70,19 @@ def permission_required(permission_name):
             if user.role == "admin":
                 return f(*args, **kwargs)
                 
-            perms = user.permissoes or {}
+            # Default permissions se for vazio ou None
+            default_perms = {
+                "update_price": False,
+                "view_history": False,
+                "view_promotions": False,
+                "view_boost": False,
+                "view_settings": False
+            }
+            
+            # Recupera permissões do banco e faz o merge com os padrões
+            user_perms = user.permissoes if user.permissoes else {}
+            perms = {**default_perms, **(user_perms if isinstance(user_perms, dict) else {})}
+            
             # Se a permissão não for explicitamente True, bloqueia
             if not perms.get(permission_name):
                 return jsonify({

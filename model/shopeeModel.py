@@ -36,10 +36,10 @@ class Usuario(db.Model):
     def to_dict(self):
         # Default permissions se for vazio ou None
         default_perms = {
-            "update_price": True,
+            "update_price": False,
             "view_history": False,
-            "view_promotions": True,
-            "view_boost": True,
+            "view_promotions": False,
+            "view_boost": False,
             "view_settings": False
         }
         

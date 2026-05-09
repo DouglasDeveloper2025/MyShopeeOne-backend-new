@@ -184,30 +184,42 @@ class BoostController:
             .filter(Anuncios.estoque_total >= 3)
         )
 
-        # Prioridade vem sempre na frente (os que estão na fila de prioridade)
+        # Prioridade vem sempre na frente
         priority = (
             base_query.filter_by(boost_priority=True)
             .order_by(Anuncios.last_boost_at.asc().nullsfirst())
+            .limit(limit)
             .all()
         )
 
         config = Configuracoes.query.first()
         mode = config.boost_mode if config else "sequential"
 
-        if mode == "sequential":
-            normal = (
-                base_query.filter_by(boost_priority=False)
-                .order_by(
-                    Anuncios.last_boost_at.asc().nullsfirst(), Anuncios.sku_pai.asc()
+        # Calcula quanto ainda precisamos buscar
+        remaining_limit = max(0, limit - len(priority))
+        
+        normal = []
+        if remaining_limit > 0:
+            if mode == "sequential":
+                normal = (
+                    base_query.filter_by(boost_priority=False)
+                    .order_by(
+                        Anuncios.last_boost_at.asc().nullsfirst(), Anuncios.sku_pai.asc()
+                    )
+                    .limit(remaining_limit)
+                    .all()
                 )
-                .all()
-            )
-        else:
-            normal = base_query.filter_by(boost_priority=False).all()
-            random.shuffle(normal)
+            else:
+                # Para aleatório com muitos itens, pegamos uma amostra maior e embaralhamos
+                normal = (
+                    base_query.filter_by(boost_priority=False)
+                    .limit(remaining_limit * 2) 
+                    .all()
+                )
+                random.shuffle(normal)
+                normal = normal[:remaining_limit]
 
-        combined = priority + normal
-        return combined[:limit]
+        return priority + normal
 
 
 def run_boost_job():

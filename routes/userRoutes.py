@@ -70,11 +70,22 @@ def register():
     user = Usuario(nome=nome, email=email)
     user.set_senha(senha)
 
+    # Permissões padrão para novos usuários (operadores)
+    user.permissoes = {
+        "update_price": True,
+        "view_history": False,
+        "view_promotions": True,
+        "view_boost": True,
+        "view_settings": False
+    }
+
     # Lógica de Role e Ativação
     total_users = Usuario.query.count()
     if total_users == 0:
         user.role = "admin"
         user.ativo = True
+        # Admins têm tudo ativado
+        user.permissoes = {k: True for k in user.permissoes.keys()}
     else:
         user.role = "operador"
         user.ativo = False

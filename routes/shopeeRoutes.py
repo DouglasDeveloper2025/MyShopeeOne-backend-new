@@ -228,26 +228,30 @@ def get_boost_status():
         logs = BoostLog.query.order_by(BoostLog.criado_em.desc()).limit(20).all()
 
         # Busca produtos configurados para boost (Apenas Ativos e COM ESTOQUE MINIMO >= 3)
-        enabled_count = (
-            Anuncios.query.filter(Anuncios.status.in_(["NORMAL", "ATIVO"]))
-            .filter(Anuncios.estoque_total >= 3)
-            .count()
+        enabled_query = Anuncios.query.filter(Anuncios.status.in_(["NORMAL", "ATIVO"])).filter(
+            Anuncios.estoque_total >= 3
         )
-        priority_count = (
-            Anuncios.query.filter(Anuncios.status.in_(["NORMAL", "ATIVO"]))
-            .filter(Anuncios.estoque_total >= 3)
-            .filter_by(boost_priority=True)
-            .count()
-        )
+        enabled_count = enabled_query.count()
+        
+        priority_query = enabled_query.filter_by(boost_priority=True)
+        priority_count = priority_query.count()
+
+        logger.info(f"Boost Status: {enabled_count} itens elegíveis, {priority_count} prioridades encontradas.")
 
         # Busca próximos da fila (50 slots futuros)
         next_boosts = controller.get_next_boosts(limit=50)
 
-        # Enriquecer active_boosts com dados locais (Nome e SKU)
+        # Enriquecer active_boosts com dados locais (Nome e SKU) em lote
+        item_ids = [str(ab.get("item_id")) for ab in active_boosts]
+        local_items = {
+            a.shopee_item_id: a
+            for a in Anuncios.query.filter(Anuncios.shopee_item_id.in_(item_ids)).all()
+        }
+
         enriched_active = []
         for ab in active_boosts:
             item_id = str(ab.get("item_id"))
-            local_item = Anuncios.query.filter_by(shopee_item_id=item_id).first()
+            local_item = local_items.get(item_id)
             enriched_active.append(
                 {
                     "item_id": item_id,
@@ -503,6 +507,11 @@ def _format_announcement(a: Anuncios, dias_espera: int = 0):
     """Auxiliar para formatar um objeto Anuncios para o frontend."""
     from model.shopeeModel import HistoricoPreco
     from datetime import datetime
+    import pytz
+
+    agora_br = datetime.now(pytz.timezone("America/Sao_Paulo")).replace(
+        tzinfo=None
+    )
 
     item_data = {
         "itemId": a.shopee_item_id,
@@ -565,24 +574,38 @@ def _format_announcement(a: Anuncios, dias_espera: int = 0):
 
         dias_faltantes = 0
         if dias_espera > 0 and p.preco_modificado_em:
-            import pytz
-
-            agora_br = datetime.now(pytz.timezone("America/Sao_Paulo")).replace(
-                tzinfo=None
-            )
             dias_passados = (agora_br - p.preco_modificado_em).days
             if dias_passados < dias_espera:
                 dias_faltantes = dias_espera - dias_passados
 
+        p_data = {
+            "modelId": mid,
+            "nome_variacao": nome_clean,
+            "sku": sku_clean,
+            "price": display_price,
+            "price_base": p.preco_base,
+            "price_promo": p.preco_promocional,
+            "promotion_id": p.promotion_id,
+            "ean": p.ean,
+            "status": p.situacao,
+            "dias_faltantes": dias_faltantes,
+            "updatedAt": p.updated_at.strftime("%d/%m/%Y %H:%M:%S")
+            if p.updated_at
+            else "",
+            "unitary_locked": False,
+            "unitary_lock_days": 0,
+        }
+
         # --- Precificação Automática de COMBOS ---
         suggested_price = None
+        base_prod = None
+        bp = None
         import re
 
         combo_detected = False
 
         if sku_clean:
             # === MÉTODO 1: Combo por sufixo -C{N} no final do SKU ===
-            # Ex: ABC-C2, ABC-C3 → base = ABC, busca no banco
             end_match = re.search(r"[- ]C(\d+)$", sku_clean, re.IGNORECASE)
             if end_match:
                 try:
@@ -618,31 +641,35 @@ def _format_announcement(a: Anuncios, dias_espera: int = 0):
                             if bp and bp > 0:
                                 suggested_price = round((bp * n) * (0.99 ** (n - 1)), 2)
                                 combo_detected = True
+
+                                # Verificar se a unidade pai está travada
+                                if base_prod.preco_modificado_em and dias_espera > 0:
+                                    dias_passados = (agora_br - base_prod.preco_modificado_em).days
+                                    if dias_passados < dias_espera:
+                                        p_data["unitary_locked"] = True
+                                        p_data["unitary_lock_days"] = dias_espera - dias_passados
                 except Exception as e:
                     print(f"⚠️ Erro combo (sufixo) {sku_clean}: {e}")
 
             # === MÉTODO 2: Combo por padrão -C{N}-{X} no meio do SKU ===
-            # Ex: LB-02301-C2-1 → base = LB-02301-C1-1, busca irmã + banco
             if not combo_detected:
                 mid_match = re.search(r"-C(\d+)-", sku_clean, re.IGNORECASE)
                 if mid_match:
                     try:
                         n = int(mid_match.group(1))
                         if n >= 2:
-                            # Substituir apenas o número: C2→C1, C3→C1
                             base_sku = (
                                 sku_clean[: mid_match.start(1)]
                                 + "1"
                                 + sku_clean[mid_match.end(1) :]
                             )
-                            bp = None
-
                             # 1. Buscar irmã C1 no MESMO anúncio
                             for sib in all_variations:
                                 s_sku = str(sib.sku or "").strip()
                                 if str(sib.shopee_model_id or "0") == mid:
                                     continue
                                 if s_sku == base_sku:
+                                    base_prod = sib
                                     bp = (
                                         sib.preco_promocional
                                         if (
@@ -653,29 +680,8 @@ def _format_announcement(a: Anuncios, dias_espera: int = 0):
                                     )
                                     break
 
-                            # 2. Irmã sem -C no mesmo anúncio (variação unitária)
-                            if not bp:
-                                for sib in all_variations:
-                                    s_sku = str(sib.sku or "").strip()
-                                    if str(sib.shopee_model_id or "0") == mid:
-                                        continue
-                                    if not re.search(r"-C\d+", s_sku, re.IGNORECASE):
-                                        sib_p = (
-                                            sib.preco_promocional
-                                            if (
-                                                sib.preco_promocional
-                                                and sib.preco_promocional > 0
-                                            )
-                                            else sib.preco_base
-                                        )
-                                        if sib_p and sib_p > 0:
-                                            bp = sib_p
-                                            break
-
-                            # 3. Fallback: buscar no banco inteiro
                             if not bp:
                                 from model.shopeeModel import Produtos
-
                                 base_prod = Produtos.query.filter(
                                     Produtos.sku == base_sku
                                 ).first()
@@ -692,30 +698,18 @@ def _format_announcement(a: Anuncios, dias_espera: int = 0):
                             if bp and bp > 0:
                                 suggested_price = round((bp * n) * (0.99 ** (n - 1)), 2)
                                 combo_detected = True
+
+                                # Verificar se a unidade pai está travada
+                                if base_prod and base_prod.preco_modificado_em and dias_espera > 0:
+                                    dias_passados = (agora_br - base_prod.preco_modificado_em).days
+                                    if dias_passados < dias_espera:
+                                        p_data["unitary_locked"] = True
+                                        p_data["unitary_lock_days"] = dias_espera - dias_passados
                     except Exception as e:
                         print(f"⚠️ Erro combo (variação) {sku_clean}: {e}")
 
-        item_data["variacoes"].append(
-            {
-                "itemId": p.shopee_item_id,
-                "modelId": mid,
-                "nome_variacao": nome_clean,
-                "sku": p.sku,
-                "price": display_price,
-                "price_base": p.preco_base,
-                "price_promo": p.preco_promocional,
-                "suggested_price": suggested_price,  # Novo campo para o frontend
-                "promotion_id": p.promotion_id,
-                "ean": p.ean,
-                "status": p.situacao or "NORMAL",
-                "dias_faltantes": dias_faltantes,
-                "updatedAt": (
-                    p.updated_at.strftime("%d/%m/%Y %H:%M:%S")
-                    if getattr(p, "updated_at", None)
-                    else ""
-                ),
-            }
-        )
+        p_data["suggested_price"] = suggested_price
+        item_data["variacoes"].append(p_data)
 
     if item_data["variacoes"]:
         # Calcular min/max com base no que o cliente realmente paga (display_price)
@@ -740,7 +734,7 @@ def _format_announcement(a: Anuncios, dias_espera: int = 0):
 
 @shopee_bp.route("/shopee/sync-all", methods=["POST"])
 @token_required
-@permission_required("update_price")
+@admin_required
 def sync_all_announcements():
     from config.redis_config import shopee_queue
 
@@ -801,7 +795,7 @@ def sync_item(item_id):
 
 @shopee_bp.route("/shopee/sync-batch", methods=["POST"])
 @token_required
-@permission_required("update_price")
+@admin_required
 def sync_batch():
     """Sincroniza uma lista de itens específicos."""
     dados = request.get_json()
@@ -892,13 +886,13 @@ def get_announcements():
         elif filter_type == "promo":
             subq = db.session.query(Produtos.shopee_item_id).filter(
                 (Produtos.promotion_id != None) & (Produtos.promotion_id != "")
-            ).distinct().subquery()
+            ).distinct().scalar_subquery()
             filters.append(Anuncios.shopee_item_id.in_(subq))
             
         elif filter_type in ["no-promo", "available"]:
             subq = db.session.query(Produtos.shopee_item_id).filter(
                 (Produtos.promotion_id != None) & (Produtos.promotion_id != "")
-            ).distinct().subquery()
+            ).distinct().scalar_subquery()
             filters.append(~Anuncios.shopee_item_id.in_(subq))
             
         elif filter_type == "active":
@@ -949,7 +943,7 @@ def get_announcements():
 
 @shopee_bp.route("/shopee/import-spreadsheet", methods=["POST"])
 @token_required
-@permission_required("update_price")
+@admin_required
 def import_spreadsheet():
     """
     Importa anúncios de uma planilha. Prioriza o banco local e faz fallback para a API Shopee.
@@ -1135,7 +1129,7 @@ def update_price_api():
                 is_locked, _, lock_msg = shopee_service.validate_price_lock(
                     item_id, m_id
                 )
-                if is_locked:
+                if is_locked and not dados.get("force"):
                     return jsonify({"status": "erro", "mensagem": lock_msg}), 403
 
         # Suporte para lista de preços (Lote)
@@ -1156,6 +1150,7 @@ def update_price_api():
                 custom_msg=custom_msg,
                 force_promotion=force_promo,
                 origem=origem,
+                force=dados.get("force", False),
             )
             status_code = 200
         else:
@@ -1184,7 +1179,11 @@ def update_price_api():
                 )
 
             resultado, status_code = shopee_service.update_price(
-                price, item_id=item_id, model_id=model_id, user_id=user_id
+                price,
+                item_id=item_id,
+                model_id=model_id,
+                user_id=user_id,
+                force=dados.get("force", False),
             )
 
         # Se teve sucesso, anexar o anúncio atualizado para o frontend sincronizar
@@ -1551,6 +1550,8 @@ def delete_discount(discount_id):
 
 
 @shopee_bp.route("/shopee/discounts/sync-all", methods=["POST"])
+@token_required
+@admin_required
 def sync_all_campaigns_route():
     """Sincroniza todas as campanhas ativas e seus itens."""
     try:
@@ -1607,7 +1608,7 @@ def add_discount_items_route(discount_id):
 
         origem = dados.get("origem", "Promocoes")
         res, code = shopee_service.add_discount_item(
-            creds, discount_id, items, origem=origem
+            creds, discount_id, items, origem=origem, force=dados.get("force", False)
         )
         return jsonify(res), code
     except Exception as e:
@@ -1662,7 +1663,9 @@ def auto_promote_route():
         if erro:
             return jsonify({"status": "erro", "mensagem": erro}), 401
 
-        res, code = shopee_service.auto_promote_item(creds, item_id, model_id)
+        res, code = shopee_service.auto_promote_item(
+            creds, item_id, model_id, force=dados.get("force", False)
+        )
 
         return jsonify(res), code
     except Exception as e:
@@ -1671,6 +1674,7 @@ def auto_promote_route():
 
 @shopee_bp.route("/shopee/notifications", methods=["GET"])
 @token_required
+@permission_required("update_price")
 def get_notifications():
     """Retorna as notificações do sistema."""
     from model.shopeeModel import NotificacaoSistema
@@ -1689,6 +1693,7 @@ def get_notifications():
 
 @shopee_bp.route("/shopee/notifications/read-all", methods=["POST"])
 @token_required
+@permission_required("update_price")
 def mark_all_notifications_as_read():
     """Marca todas as notificações como lidas."""
     from model.shopeeModel import NotificacaoSistema
@@ -1705,6 +1710,7 @@ def mark_all_notifications_as_read():
 
 @shopee_bp.route("/shopee/notifications/<int:id>/read", methods=["POST"])
 @token_required
+@permission_required("update_price")
 def mark_notification_as_read(id):
     """Marca uma notificação específica como lida."""
     from model.shopeeModel import NotificacaoSistema

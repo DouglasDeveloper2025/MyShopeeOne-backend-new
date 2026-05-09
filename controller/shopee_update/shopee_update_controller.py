@@ -790,7 +790,7 @@ class ShopeeService:
             return {"status": "erro", "mensagem": str(e)}
 
     def update_price(
-        self, preco_desejado, item_id=None, sku=None, model_id=None, user_id=None
+        self, preco_desejado, item_id=None, sku=None, model_id=None, user_id=None, force=False
     ):
         creds, erro = self.tokens.ensure_valid_token(1)
         if erro:
@@ -825,7 +825,7 @@ class ShopeeService:
             pass
 
         resultado = self._atualizar_na_shopee(
-            int(identificador), int(model_id or 0), float(preco_desejado), creds
+            int(identificador), int(model_id or 0), float(preco_desejado), creds, force=force
         )
         return resultado, 200
 
@@ -966,6 +966,7 @@ class ShopeeService:
         custom_msg=None,
         force_promotion=False,
         origem=None,
+        force=False,
     ):
         """
         Lógica principal de atualização na Shopee.
@@ -1147,7 +1148,7 @@ class ShopeeService:
                         item_id, mid_atual
                     )
 
-                    if is_locked and dias_espera > 0:
+                    if is_locked and dias_espera > 0 and not force:
                         self._criar_notificacao(
                             tipo="bloqueio",
                             titulo=f"Bloqueio de {dias_espera} Dias",
@@ -1232,7 +1233,7 @@ class ShopeeService:
                 from model.shopeeModel import NotificacaoSistema
 
                 NotificacaoSistema.query.filter_by(
-                    item_id=str(item_id), tipo="desbloqueio", lida=False
+                    shopee_item_id=str(item_id), tipo="desbloqueio", lida=False
                 ).update({"lida": True})
                 db.session.commit()
             except Exception as e:
@@ -1311,6 +1312,7 @@ class ShopeeService:
         custom_msg=None,
         force_promotion=False,
         origem=None,
+        force=False,
     ):
         """Versão lote - para importação de planilha ou Modal com variações."""
         creds, erro = self.tokens.ensure_valid_token(1)
@@ -1355,6 +1357,7 @@ class ShopeeService:
                 custom_msg=custom_msg,
                 force_promotion=force_promotion,
                 origem=origem,
+                force=force,
             )
 
             resultados.append({"sku": p_req.get("sku"), **res})
@@ -1418,7 +1421,7 @@ class ShopeeService:
     ):
         """Grava no histórico e garante que Pai/Filho existam no banco sem duplicidade."""
         try:
-            agora = self.fusoBrasilia()
+            agora = self._get_brasilia_time()
             from model.shopeeModel import Anuncios, Produtos
 
             # 1. Garantir que o Anúncio (Pai) existe
@@ -2305,7 +2308,7 @@ class ShopeeService:
 
         return {"item_list": [], "total": 0, "pages": 0, "more": False}
 
-    def auto_promote_item(self, creds, item_id, model_id):
+    def auto_promote_item(self, creds, item_id, model_id, force=False):
         """Busca uma campanha ativa com espaço e adiciona o item com 25% de desconto."""
         from model.shopeeModel import Produtos, Promocoes, db
         import time
@@ -2398,6 +2401,7 @@ class ShopeeService:
                 items_to_add,
                 log_msg="Campanha de Promoção",
                 origem="Notificações",
+                force=force,
             )
 
             if code == 200:
@@ -2422,6 +2426,7 @@ class ShopeeService:
         items,
         log_msg="Preço de Promoção Atualizado",
         origem=None,
+        force=False,
     ):
         """
         Adiciona itens a uma promoção existente e atualiza o Banco Local.
@@ -2445,7 +2450,7 @@ class ShopeeService:
                 for m in models:
                     mid = str(m.get("model_id"))
                     is_locked, _, msg = self.validate_price_lock(iid, mid)
-                    if is_locked:
+                    if is_locked and not force:
                         # Retornar no formato que a rota espera (que por sua vez repassa o status_code)
                         return {
                             "status": "erro",
@@ -2455,7 +2460,7 @@ class ShopeeService:
                         }, 403
             else:
                 is_locked, _, msg = self.validate_price_lock(iid, 0)
-                if is_locked:
+                if is_locked and not force:
                     return {
                         "status": "erro",
                         "error": "error_param",

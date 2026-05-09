@@ -81,79 +81,64 @@ def serve(path):
 def background_checker():
     """Tarefa que roda em segundo plano para enfileirar jobs no RQ."""
     import time
+    import os as native_os
     from datetime import datetime
     import pytz
     from config.redis_config import shopee_queue
 
+    pid = native_os.getpid()
     tz_br = pytz.timezone("America/Sao_Paulo")
+    last_run_minute = -1
+
+    print(f"[*] Agendador de tarefas iniciado (PID: {pid})")
 
     while True:
         try:
-            # Pega o horário atual em São Paulo
             now = datetime.now(tz_br)
+            current_minute = now.minute
 
-            from model.shopeeModel import IntegracaoShopee, Configuracoes
-            from datetime import datetime as dt_utc, timedelta
+            if current_minute != last_run_minute:
+                from model.shopeeModel import IntegracaoShopee, Configuracoes
+                from datetime import datetime as dt_utc, timedelta
 
-            with app.app_context():
-                config = Configuracoes.query.first()
-                integracao = IntegracaoShopee.query.first()
+                with app.app_context():
+                    config = Configuracoes.query.first()
+                    integracao = IntegracaoShopee.query.first()
 
-                # 1. Checagem de Token Shopee
-                if integracao and integracao.last_access_update_at:
-                    agora_utc = dt_utc.utcnow()
-                    # Busca a configuração de intervalo do banco (ou usa 230 min como fallback)
-                    intervalo_min = config.intervalo_refresh_token if config else 230
+                    # 1. Checagem de Token
+                    if integracao and integracao.last_access_update_at:
+                        agora_utc = dt_utc.utcnow()
+                        intervalo_min = config.intervalo_refresh_token if config else 230
+                        if (agora_utc - integracao.last_access_update_at) >= timedelta(minutes=intervalo_min):
+                            shopee_queue.enqueue("controller.auth.authShopee.run_token_refresh_job", job_id="shopee_token_refresh_auto")
 
-                    # Se o token tem mais que o intervalo definido, enfileira a renovação
-                    if (agora_utc - integracao.last_access_update_at) >= timedelta(
-                        minutes=intervalo_min
-                    ):
-                        print(
-                            f"[{now.strftime('%H:%M:%S')}] Token Shopee próximo do limite ({intervalo_min} min). Enfileirando renovação no RQ..."
-                        )
-                        shopee_queue.enqueue(
-                            "controller.auth.authShopee.run_token_refresh_job",
-                            job_id="shopee_token_refresh_auto",
-                        )
+                    # 2. Sincronização Agendada
+                    target_h = config.hora_sincronizacao if config else 0
+                    target_m = config.minuto_sincronizacao if config else 15
+                    if now.hour == target_h and now.minute == target_m:
+                        shopee_queue.enqueue("controller.shopee_update.shopee_update_controller.run_full_sync_job")
 
-                # 2. Sincronização COMPLETA Agendada
-                target_h = config.hora_sincronizacao if config else 0
-                target_m = config.minuto_sincronizacao if config else 15
+                    # 3. Boost Automático
+                    job_id = f"shopee_boost_cycle_{now.strftime('%Y%m%d%H%M')}"
+                    shopee_queue.enqueue("controller.shopee_boost.run_boost_job", job_id=job_id)
+                    
+                    print(f"[{now.strftime('%H:%M:%S')}] Job enfileirado: {job_id} (PID: {pid})")
 
-                if now.hour == target_h and now.minute == target_m:
-                    print(
-                        f"[{now.strftime('%d/%m/%Y %H:%M:%S')}] Enfileirando SINCRONIZAÇÃO COMPLETA agendada ({target_h:02d}:{target_m:02d}) no RQ..."
-                    )
-                    shopee_queue.enqueue(
-                        "controller.shopee_update.shopee_update_controller.run_full_sync_job"
-                    )
-                    # Dorme por 70 segundos para garantir que saia da janela do minuto atual
-                    time.sleep(70)
+                    last_run_minute = current_minute
+                    db.session.remove()
 
-                # 3. Impulsionamento (Boost) Automático (A cada 1 minuto para manter slots cheios)
-                if now.second < 60:
-                    # O scheduler já dorme 60s no final, então rodará uma vez por minuto
-                    # print(f"[{now.strftime('%H:%M:%S')}] Verificando Slots de BOOST (1 min interval)...")
-                    shopee_queue.enqueue(
-                        "controller.shopee_boost.run_boost_job",
-                        job_id=f"shopee_boost_cycle_{now.strftime('%Y%m%d%H%M')}",
-                    )
-
-                # Limpa a sessão antes de sair do contexto para evitar conexões presas
-                db.session.remove()
-
-            # Verifica a cada 1 minuto
-            time.sleep(60)
+            time.sleep(10) # Verifica a cada 10 segundos para maior precisão
         except Exception as e:
-            print(f"?? Erro no agendamento da Fila: {e}")
-            time.sleep(60)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Erro no agendador (PID: {pid}): {e}")
+            time.sleep(30)
 
 
-# Inicia a checagem em segundo plano de forma assíncrona compatível com eventlet
-# Somente se NÃO for o worker do RQ (para não duplicar a tarefa de agendamento)
-if "worker.py" not in sys.argv[0] and os.environ.get("IS_RQ_WORKER") != "true":
-    eventlet.spawn(background_checker)
+# Inicia o agendador apenas no processo principal
+# WERKZEUG_RUN_MAIN garante que não rode no reloader
+# IS_RQ_WORKER garante que não rode no worker
+if os.environ.get("WERKZEUG_RUN_MAIN") == "true" or not app.debug:
+    if "worker.py" not in sys.argv[0] and os.environ.get("IS_RQ_WORKER") != "true":
+        eventlet.spawn(background_checker)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5005))
