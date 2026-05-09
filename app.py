@@ -110,17 +110,17 @@ def background_checker():
                         agora_utc = dt_utc.utcnow()
                         intervalo_min = config.intervalo_refresh_token if config else 230
                         if (agora_utc - integracao.last_access_update_at) >= timedelta(minutes=intervalo_min):
-                            shopee_queue.enqueue("controller.auth.authShopee.run_token_refresh_job", job_id="shopee_token_refresh_auto")
+                            shopee_queue.enqueue("controller.auth.authShopee.run_token_refresh_job", job_id="shopee_token_refresh_auto", job_timeout="5m")
 
                     # 2. Sincronização Agendada
                     target_h = config.hora_sincronizacao if config else 0
                     target_m = config.minuto_sincronizacao if config else 15
                     if now.hour == target_h and now.minute == target_m:
-                        shopee_queue.enqueue("controller.shopee_update.shopee_update_controller.run_full_sync_job")
+                        shopee_queue.enqueue("controller.shopee_update.shopee_update_controller.run_full_sync_job", job_timeout="30m")
 
                     # 3. Boost Automático
                     job_id = f"shopee_boost_cycle_{now.strftime('%Y%m%d%H%M')}"
-                    shopee_queue.enqueue("controller.shopee_boost.run_boost_job", job_id=job_id)
+                    shopee_queue.enqueue("controller.shopee_boost.run_boost_job", job_id=job_id, job_timeout="10m")
                     
                     print(f"[{now.strftime('%H:%M:%S')}] Job enfileirado: {job_id} (PID: {pid})")
 

@@ -346,9 +346,11 @@ class ShopeeService:
             # --- NOVO: Verificar desbloqueios de 15 dias após sincronizar ---
             self.verificar_desbloqueios(item_ids)
 
-            self.sync_status.update({"is_running": False, "mensagem": error_msg})
+        except Exception as e:
+            error_msg = str(e)
+            self.sync_status.update({"is_running": False, "mensagem": f"Erro crítico: {error_msg}", "error_critical": True})
             # Emitir falha
-            self._safe_emit("sync_finished", {"sucesso": False, "erro": str(e)})
+            self._safe_emit("sync_finished", {"sucesso": False, "erro": error_msg})
         finally:
             # Emitir sucesso se não caiu no except crítico
             if not self.sync_status.get("error_critical"):
