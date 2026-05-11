@@ -19,6 +19,7 @@ from model.shopeeModel import db
 from routes.shopeeRoutes import shopee_bp
 from routes.authRoutes import auth_bp
 from routes.userRoutes import user_bp
+from routes.tinyRoutes import tiny_bp
 from flask_socketio import SocketIO
 from dotenv import load_dotenv
 
@@ -63,6 +64,7 @@ db.init_app(app)
 app.register_blueprint(shopee_bp, url_prefix="/api")
 app.register_blueprint(auth_bp, url_prefix="/api")
 app.register_blueprint(user_bp, url_prefix="/api")
+app.register_blueprint(tiny_bp, url_prefix="/api")
 
 # Cria as tabelas se não existirem
 with app.app_context():
@@ -108,34 +110,49 @@ def background_checker():
                     # 1. Checagem de Token
                     if integracao and integracao.last_access_update_at:
                         agora_utc = dt_utc.utcnow()
-                        intervalo_min = config.intervalo_refresh_token if config else 230
-                        if (agora_utc - integracao.last_access_update_at) >= timedelta(minutes=intervalo_min):
-                            shopee_queue.enqueue("controller.auth.authShopee.run_token_refresh_job", job_id="shopee_token_refresh_auto", job_timeout="5m")
+                        intervalo_min = (
+                            config.intervalo_refresh_token if config else 230
+                        )
+                        if (agora_utc - integracao.last_access_update_at) >= timedelta(
+                            minutes=intervalo_min
+                        ):
+                            shopee_queue.enqueue(
+                                "controller.auth.authShopee.run_token_refresh_job",
+                                job_id="shopee_token_refresh_auto",
+                                job_timeout="5m",
+                            )
 
                     # 2. Sincronização Agendada
                     target_h = config.hora_sincronizacao if config else 0
                     target_m = config.minuto_sincronizacao if config else 15
                     if now.hour == target_h and now.minute == target_m:
-                        shopee_queue.enqueue("controller.shopee_update.shopee_update_controller.run_full_sync_job", job_timeout="3h")
+                        shopee_queue.enqueue(
+                            "controller.shopee_update.shopee_update_controller.run_full_sync_job",
+                            job_timeout="3h",
+                        )
 
                     # 3. Boost Automático
                     job_id = f"shopee_boost_cycle_{now.strftime('%Y%m%d%H%M')}"
-                    shopee_queue.enqueue("controller.shopee_boost.run_boost_job", job_id=job_id, job_timeout="10m")
-                    
-                    print(f"[{now.strftime('%H:%M:%S')}] Job enfileirado: {job_id} (PID: {pid})")
+                    shopee_queue.enqueue(
+                        "controller.shopee_boost.run_boost_job",
+                        job_id=job_id,
+                        job_timeout="10m",
+                    )
+
+                    # print(f"[{now.strftime('%H:%M:%S')}] Job enfileirado: {job_id} (PID: {pid})")
 
                     last_run_minute = current_minute
                     db.session.remove()
 
-            time.sleep(10) # Verifica a cada 10 segundos para maior precisão
+            time.sleep(30)  # Verifica a cada 30 segundos para maior precisão
         except Exception as e:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Erro no agendador (PID: {pid}): {e}")
-            time.sleep(30)
+            print(
+                f"[{datetime.now().strftime('%H:%M:%S')}] Erro no agendador (PID: {pid}): {e}"
+            )
+            time.sleep(60)
 
 
 # Inicia o agendador apenas no processo principal
-# WERKZEUG_RUN_MAIN garante que não rode no reloader
-# IS_RQ_WORKER garante que não rode no worker
 if os.environ.get("WERKZEUG_RUN_MAIN") == "true" or not app.debug:
     if "worker.py" not in sys.argv[0] and os.environ.get("IS_RQ_WORKER") != "true":
         eventlet.spawn(background_checker)

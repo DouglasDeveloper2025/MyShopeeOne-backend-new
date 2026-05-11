@@ -348,7 +348,13 @@ class ShopeeService:
 
         except Exception as e:
             error_msg = str(e)
-            self.sync_status.update({"is_running": False, "mensagem": f"Erro crítico: {error_msg}", "error_critical": True})
+            self.sync_status.update(
+                {
+                    "is_running": False,
+                    "mensagem": f"Erro crítico: {error_msg}",
+                    "error_critical": True,
+                }
+            )
             # Emitir falha
             self._safe_emit("sync_finished", {"sucesso": False, "erro": error_msg})
         finally:
@@ -792,7 +798,13 @@ class ShopeeService:
             return {"status": "erro", "mensagem": str(e)}
 
     def update_price(
-        self, preco_desejado, item_id=None, sku=None, model_id=None, user_id=None, force=False
+        self,
+        preco_desejado,
+        item_id=None,
+        sku=None,
+        model_id=None,
+        user_id=None,
+        force=False,
     ):
         creds, erro = self.tokens.ensure_valid_token(1)
         if erro:
@@ -827,7 +839,11 @@ class ShopeeService:
             pass
 
         resultado = self._atualizar_na_shopee(
-            int(identificador), int(model_id or 0), float(preco_desejado), creds, force=force
+            int(identificador),
+            int(model_id or 0),
+            float(preco_desejado),
+            creds,
+            force=force,
         )
         return resultado, 200
 
@@ -2289,6 +2305,7 @@ class ShopeeService:
                         "original_price": p.preco_base,
                         "promotion_price": p.preco_promocional or 0,
                         "stock": 0,
+                        "sku": p.sku or "",
                     }
                 )
 
@@ -2537,6 +2554,112 @@ class ShopeeService:
                             or (p.anuncio.nome if p.anuncio else "Produto"),
                             p.preco_base,  # Preço antigo (base)
                             price,  # Preço novo (promo)
+                            "sucesso",
+                            log_msg,
+                            sku=p.sku,
+                            promo_info={"promotion_id": discount_id},
+                            usuario_id=u_id,
+                            origem=origem,
+                        )
+            db.session.commit()
+
+        return resp, code
+
+    def update_discount_items_in_campaign(
+        self,
+        creds,
+        discount_id,
+        items,
+        log_msg="Preço de Promoção Atualizado (Campanha)",
+        origem=None,
+        force=False,
+    ):
+        """
+        Atualiza o preço de itens que já estão em uma promoção.
+        """
+        for itm in items:
+            iid = str(itm.get("item_id"))
+            models = itm.get("model_list", [])
+            if models:
+                for m in models:
+                    mid = str(m.get("model_id"))
+                    is_locked, _, msg = self.validate_price_lock(iid, mid)
+                    if is_locked and not force:
+                        return {
+                            "status": "erro",
+                            "error": "error_param",
+                            "message": msg,
+                            "mensagem": msg,
+                        }, 403
+            else:
+                is_locked, _, msg = self.validate_price_lock(iid, 0)
+                if is_locked and not force:
+                    return {
+                        "status": "erro",
+                        "error": "error_param",
+                        "message": msg,
+                        "mensagem": msg,
+                    }, 403
+
+        path = "/api/v2/discount/update_discount_item"
+        payload = {"discount_id": int(discount_id), "item_list": items}
+        resp, code = self._shopee_request(path, creds, method="POST", json_data=payload)
+
+        if code == 200:
+            for itm in items:
+                iid = str(itm.get("item_id"))
+                models = itm.get("model_list", [])
+                if models:
+                    for m in models:
+                        mid = str(m.get("model_id"))
+                        price = float(m.get("model_promotion_price") or 0)
+                        p = Produtos.query.filter_by(
+                            shopee_item_id=iid, shopee_model_id=mid
+                        ).first()
+                        if p:
+                            p.preco_promocional = price
+                            from flask import g
+
+                            u_id = (
+                                getattr(g, "current_user", None).id
+                                if hasattr(g, "current_user") and g.current_user
+                                else None
+                            )
+                            self._log_and_save_update(
+                                iid,
+                                mid,
+                                p.nome_variacao
+                                or (p.anuncio.nome if p.anuncio else "Produto"),
+                                p.preco_base,
+                                price,
+                                "sucesso",
+                                log_msg,
+                                sku=p.sku,
+                                promo_info={"promotion_id": discount_id},
+                                usuario_id=u_id,
+                                origem=origem,
+                            )
+                else:
+                    price = float(itm.get("item_promotion_price") or 0)
+                    p = Produtos.query.filter_by(
+                        shopee_item_id=iid, shopee_model_id="0"
+                    ).first()
+                    if p:
+                        p.preco_promocional = price
+                        from flask import g
+
+                        u_id = (
+                            getattr(g, "current_user", None).id
+                            if hasattr(g, "current_user") and g.current_user
+                            else None
+                        )
+                        self._log_and_save_update(
+                            iid,
+                            "0",
+                            p.nome_variacao
+                            or (p.anuncio.nome if p.anuncio else "Produto"),
+                            p.preco_base,
+                            price,
                             "sucesso",
                             log_msg,
                             sku=p.sku,

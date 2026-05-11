@@ -24,32 +24,41 @@ class BoostController:
         boosted_items = resp.get("response", {}).get("item_list", [])
         boosted_ids = [str(item["item_id"]) for item in boosted_items]
 
-        # 1. Reset status de quem não está mais na lista da Shopee
-        anuncios_ativos = Anuncios.query.filter(Anuncios.boost_end_at != None).all()
-        for anuncio in anuncios_ativos:
-            if anuncio.shopee_item_id not in boosted_ids:
+        agora = get_br_now()
+
+        # 1. Reset status de quem não está mais na lista da Shopee E cujo prazo já venceu
+        anuncios_ativos_db = Anuncios.query.filter(Anuncios.boost_end_at != None).all()
+        for anuncio in anuncios_ativos_db:
+            # Se não está na lista da Shopee OU se o tempo já passou localmente
+            if anuncio.shopee_item_id not in boosted_ids and anuncio.boost_end_at <= agora:
                 anuncio.boost_end_at = None
                 self._log_boost(
                     anuncio.shopee_item_id,
                     "boost_expired",
                     "info",
-                    f"Boost de '{anuncio.nome}' expirou na Shopee.",
+                    f"Boost de '{anuncio.nome}' expirou e slot foi liberado.",
+                    anuncio.nome
                 )
 
-        # 2. Atualiza status de quem está na lista
+        # 2. Atualiza status de quem está na lista vinda da API
         for item in boosted_items:
             item_id = str(item["item_id"])
             anuncio = Anuncios.query.filter_by(shopee_item_id=item_id).first()
             if anuncio:
-                # Na v2, cool_down_second é o tempo restante em segundos
                 remaining_seconds = item["cool_down_second"]
-                end_time = get_br_now() + timedelta(seconds=remaining_seconds)
+                end_time = agora + timedelta(seconds=remaining_seconds)
                 anuncio.boost_end_at = end_time
-                # Define o início aproximado (4 horas antes do fim)
                 anuncio.last_boost_at = end_time - timedelta(hours=4)
 
         db.session.commit()
-        return len(boosted_ids)
+
+        # 3. Reforço de Segurança: O número de slots ocupados será o MAIOR valor 
+        # entre o que a API relata e o que nosso banco de dados sabe que ainda não venceu.
+        # Isso impede tentativas duplicadas se a API falhar em retornar a lista.
+        ativos_locais = Anuncios.query.filter(Anuncios.boost_end_at > agora).count()
+        true_active_count = max(len(boosted_ids), ativos_locais)
+        
+        return true_active_count
 
     def run_boost_cycle(self):
         """Lógica principal do Worker: Sincroniza, verifica slots e impulsiona o próximo."""
@@ -197,14 +206,15 @@ class BoostController:
 
         # Calcula quanto ainda precisamos buscar
         remaining_limit = max(0, limit - len(priority))
-        
+
         normal = []
         if remaining_limit > 0:
             if mode == "sequential":
                 normal = (
                     base_query.filter_by(boost_priority=False)
                     .order_by(
-                        Anuncios.last_boost_at.asc().nullsfirst(), Anuncios.sku_pai.asc()
+                        Anuncios.last_boost_at.asc().nullsfirst(),
+                        Anuncios.sku_pai.asc(),
                     )
                     .limit(remaining_limit)
                     .all()
@@ -213,7 +223,7 @@ class BoostController:
                 # Para aleatório com muitos itens, pegamos uma amostra maior e embaralhamos
                 normal = (
                     base_query.filter_by(boost_priority=False)
-                    .limit(remaining_limit * 2) 
+                    .limit(remaining_limit * 2)
                     .all()
                 )
                 random.shuffle(normal)

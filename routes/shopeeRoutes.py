@@ -224,8 +224,10 @@ def get_boost_status():
         config = Configuracoes.query.first()
         boost_mode = config.boost_mode if config else "sequential"
 
-        # Busca logs recentes
-        logs = BoostLog.query.order_by(BoostLog.criado_em.desc()).limit(20).all()
+        # Busca logs recentes (Apenas impulsionados e erros)
+        logs = BoostLog.query.filter(
+            BoostLog.acao.in_(["boost_start", "boost_error", "sync_error", "cycle_error"])
+        ).order_by(BoostLog.criado_em.desc()).limit(20).all()
 
         # Busca produtos configurados para boost (Apenas Ativos e COM ESTOQUE MINIMO >= 3)
         enabled_query = Anuncios.query.filter(Anuncios.status.in_(["NORMAL", "ATIVO"])).filter(
@@ -1441,6 +1443,10 @@ def search_discounts_by_product():
                     "start_time": int(p.start_time.timestamp()) if p.start_time else 0,
                     "end_time": int(p.end_time.timestamp()) if p.end_time else 0,
                     "discount_status": p.status or "unknown",
+                    "item_count": db.session.query(Produtos.shopee_item_id)
+                    .filter_by(promotion_id=str(p.discount_id))
+                    .distinct()
+                    .count(),
                 }
             )
 
@@ -1608,6 +1614,29 @@ def add_discount_items_route(discount_id):
 
         origem = dados.get("origem", "Promocoes")
         res, code = shopee_service.add_discount_item(
+            creds, discount_id, items, origem=origem, force=dados.get("force", False)
+        )
+        return jsonify(res), code
+    except Exception as e:
+        return jsonify({"status": "erro", "mensagem": str(e)}), 500
+
+
+@shopee_bp.route("/shopee/discounts/<discount_id>/items", methods=["PUT"])
+def update_discount_items_route(discount_id):
+    """Atualiza itens em uma promoção."""
+    try:
+        dados = request.get_json()
+        items = dados.get("items", [])
+
+        if not items:
+            return jsonify({"status": "erro", "mensagem": "Nenhum item enviado"}), 400
+
+        creds, erro = auth_shopee.ensure_valid_token()
+        if erro:
+            return jsonify({"status": "erro", "mensagem": erro}), 401
+
+        origem = dados.get("origem", "Promocoes Edicao")
+        res, code = shopee_service.update_discount_items_in_campaign(
             creds, discount_id, items, origem=origem, force=dados.get("force", False)
         )
         return jsonify(res), code
