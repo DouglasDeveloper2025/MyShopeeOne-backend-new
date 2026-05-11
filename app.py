@@ -116,7 +116,7 @@ def background_checker():
                     target_h = config.hora_sincronizacao if config else 0
                     target_m = config.minuto_sincronizacao if config else 15
                     if now.hour == target_h and now.minute == target_m:
-                        shopee_queue.enqueue("controller.shopee_update.shopee_update_controller.run_full_sync_job", job_timeout="30m")
+                        shopee_queue.enqueue("controller.shopee_update.shopee_update_controller.run_full_sync_job", job_timeout="3h")
 
                     # 3. Boost Automático
                     job_id = f"shopee_boost_cycle_{now.strftime('%Y%m%d%H%M')}"

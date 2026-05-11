@@ -738,11 +738,11 @@ def _format_announcement(a: Anuncios, dias_espera: int = 0):
 def sync_all_announcements():
     from config.redis_config import shopee_queue
 
-    # Enfileira o trabalho no RQ com um timeout de 1 hora (3600 segundos)
+    # Enfileira o trabalho no RQ com um timeout de 3 horas (10800 segundos)
     # já que sincronizações grandes podem demorar bastante.
     job = shopee_queue.enqueue(
         "controller.shopee_update.shopee_update_controller.run_full_sync_job",
-        job_timeout=3600,
+        job_timeout=10800,
     )
 
     return (
