@@ -1507,6 +1507,7 @@ def get_discounts():
 
 
 @shopee_bp.route("/shopee/discounts", methods=["POST"])
+@token_required
 def add_discount():
     """Cria uma nova campanha de promoção."""
     try:
@@ -1537,6 +1538,7 @@ def add_discount():
 
 
 @shopee_bp.route("/shopee/discounts/<discount_id>", methods=["DELETE"])
+@token_required
 def delete_discount(discount_id):
     """Exclui (upcoming) ou Encerra (ongoing) uma campanha."""
     try:
@@ -1599,6 +1601,7 @@ def get_discount_items(discount_id):
 
 
 @shopee_bp.route("/shopee/discounts/<discount_id>/items", methods=["POST"])
+@token_required
 def add_discount_items_route(discount_id):
     """Adiciona itens a uma promoção."""
     try:
@@ -1622,6 +1625,7 @@ def add_discount_items_route(discount_id):
 
 
 @shopee_bp.route("/shopee/discounts/<discount_id>/items", methods=["PUT"])
+@token_required
 def update_discount_items_route(discount_id):
     """Atualiza itens em uma promoção."""
     try:
@@ -1647,6 +1651,7 @@ def update_discount_items_route(discount_id):
 @shopee_bp.route(
     "/shopee/discounts/<discount_id>/items/<item_id>/<model_id>", methods=["DELETE"]
 )
+@token_required
 def delete_discount_item_route(discount_id, item_id, model_id):
     """Remove um item/variação de uma promoção."""
     try:
@@ -1678,6 +1683,7 @@ def get_item_info(item_id):
 
 
 @shopee_bp.route("/shopee/alerts/auto-promote", methods=["POST"])
+@token_required
 def auto_promote_route():
     """Aciona a promoção automática de 25% para um item de alerta."""
     try:

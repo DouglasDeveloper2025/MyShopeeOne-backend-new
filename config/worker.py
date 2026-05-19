@@ -27,6 +27,7 @@ if backend_root not in sys.path:
 from flask import Flask
 from flask_sqlalchemy import SQLAlchemy
 from rq import SimpleWorker
+from rq.timeouts import TimerDeathPenalty
 from config.redis_config import redis_conn
 from model.shopeeModel import db          # Mesmo db do app principal
 
@@ -65,7 +66,14 @@ def start_worker():
 
     with worker_app.app_context():
         print("--- RQ Worker Iniciado (SimpleWorker, sem eventlet) ---")
-        worker = SimpleWorker(LISTEN_QUEUES, connection=redis_conn)
+        if os.name == 'nt':
+            print("Windows detectado: configurando TimerDeathPenalty para evitar falhas de SIGALRM")
+            class WindowsSimpleWorker(SimpleWorker):
+                death_penalty_class = TimerDeathPenalty
+            worker = WindowsSimpleWorker(LISTEN_QUEUES, connection=redis_conn)
+        else:
+            worker = SimpleWorker(LISTEN_QUEUES, connection=redis_conn)
+            
         worker.work(with_scheduler=True)
 
 

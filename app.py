@@ -101,7 +101,7 @@ def background_checker():
 
             if current_minute != last_run_minute:
                 from model.shopeeModel import IntegracaoShopee, Configuracoes
-                from datetime import datetime as dt_utc, timedelta
+                from datetime import datetime as dt_utc, timedelta, UTC
 
                 with app.app_context():
                     config = Configuracoes.query.first()
@@ -109,7 +109,7 @@ def background_checker():
 
                     # 1. Checagem de Token
                     if integracao and integracao.last_access_update_at:
-                        agora_utc = dt_utc.utcnow()
+                        agora_utc = dt_utc.now(UTC).replace(tzinfo=None)
                         intervalo_min = (
                             config.intervalo_refresh_token if config else 230
                         )
