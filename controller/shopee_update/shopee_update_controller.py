@@ -881,11 +881,51 @@ class ShopeeService:
                     pass
 
             # 1. Gerar mensagem detalhada se for sucesso
-            if status == "sucesso" and msg == "Atualizado":
-                if promo_info:
-                    msg = f"Promoção atualizada"
-                else:
-                    msg = f"Preço atualizado"
+            if status == "sucesso":
+                # Se for sucesso, gerar mensagem descritiva detalhada de acordo com a origem
+                if msg in [
+                    "Atualizado", 
+                    "Preço atualizado", 
+                    "Promoção atualizada", 
+                    "Preço de Promoção Atualizado", 
+                    "Anuncio colocado em promoção",
+                    "Preço de Promoção Atualizado (Campanha)"
+                ]:
+                    if origem in ["Promocoes", "Promocoes Edicao"]:
+                        campanha_nome = "Desconhecida"
+                        if promo_info:
+                            promo_id = promo_info.get("promotion_id") or promo_info.get("discount_id")
+                            if promo_id:
+                                from model.shopeeModel import Promocoes
+                                camp = Promocoes.query.filter_by(discount_id=int(promo_id)).first()
+                                if camp:
+                                    campanha_nome = camp.discount_name
+                                else:
+                                    campanha_nome = f"ID {promo_id}"
+                        
+                        percentual = round((1.0 - (float(p_novo) / float(p_antigo))) * 100.0, 1) if float(p_antigo) > 0 else 0.0
+                        if origem == "Promocoes":
+                            if str(model_id) != "0":
+                                msg = f"Colocou a variação '{nome}' na campanha '{campanha_nome}' em promoção com desconto de ({percentual}%)"
+                            else:
+                                msg = f"Colocou o anúncio na campanha '{campanha_nome}' em promoção com desconto de ({percentual}%)"
+                        else: # Promocoes Edicao
+                            if str(model_id) != "0":
+                                msg = f"Alterou o preço promocional da variação '{nome}' na campanha '{campanha_nome}' com desconto de ({percentual}%)"
+                            else:
+                                msg = f"Alterou o preço promocional do anúncio na campanha '{campanha_nome}' com desconto de ({percentual}%)"
+                    
+                    elif origem == "Notificação" or origem == "Alertas":
+                        if str(model_id) != "0":
+                            msg = f"Alterou o preço da variação '{nome}' pela Notificação"
+                        else:
+                            msg = f"Alterou o preço do anúncio pela Notificação"
+                    
+                    else: # Anuncios / Home
+                        if str(model_id) != "0":
+                            msg = f"Alterou o preço da variação '{nome}'"
+                        else:
+                            msg = f"Alterou o preço do anúncio"
 
             # 2. Registrar no Histórico
             novo_log = HistoricoPreco(

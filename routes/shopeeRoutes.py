@@ -305,9 +305,28 @@ def toggle_boost():
         return jsonify({"mensagem": "Anúncio não encontrado"}), 404
 
     anuncio.boost_enabled = enabled
+
+    # Registrar histórico detalhado
+    from model.shopeeModel import HistoricoPreco, get_br_now
+    user_id = g.current_user.id if hasattr(g, "current_user") and g.current_user else None
+    status_msg = "ativado" if enabled else "desativado"
+
+    log = HistoricoPreco(
+        shopee_item_id=str(item_id),
+        shopee_model_id="0",
+        nome_produto=anuncio.nome,
+        preco_anterior=0.0,
+        preco_atual=0.0,
+        status="sucesso",
+        mensagem=f"Definiu o impulsionamento automático como {status_msg.capitalize()}",
+        sku=anuncio.sku_pai,
+        origem="Impulsionar",
+        usuario_id=user_id,
+        criado_em=get_br_now()
+    )
+    db.session.add(log)
     db.session.commit()
 
-    status_msg = "ativado" if enabled else "desativado"
     return jsonify(
         {"mensagem": f"Impulsionamento automático {status_msg} para {anuncio.nome}"}
     )
@@ -327,7 +346,28 @@ def toggle_boost_priority():
         return jsonify({"mensagem": "Anúncio não encontrado"}), 404
 
     anuncio.boost_priority = priority
+
+    # Registrar histórico detalhado
+    from model.shopeeModel import HistoricoPreco, get_br_now
+    user_id = g.current_user.id if hasattr(g, "current_user") and g.current_user else None
+    status_msg = "ativada" if priority else "desativada"
+
+    log = HistoricoPreco(
+        shopee_item_id=str(item_id),
+        shopee_model_id="0",
+        nome_produto=anuncio.nome,
+        preco_anterior=0.0,
+        preco_atual=0.0,
+        status="sucesso",
+        mensagem=f"Definiu a prioridade de impulsionamento como {status_msg.capitalize()}",
+        sku=anuncio.sku_pai,
+        origem="Impulsionar",
+        usuario_id=user_id,
+        criado_em=get_br_now()
+    )
+    db.session.add(log)
     db.session.commit()
+
     return jsonify(
         {
             "mensagem": f"Prioridade {'ativada' if priority else 'desativada'} para {anuncio.nome}"
@@ -396,6 +436,15 @@ def manual_boost():
         logging.getLogger(__name__).error(
             f"Erro no Impulso Manual (Item {item_id}): {resp}"
         )
+
+        # Se falhou por cooldown de 240min, atualiza last_boost_at no banco
+        if "240min" in msg.lower() or "cooldown" in msg.lower() or "under 240" in msg.lower():
+            anuncio = Anuncios.query.filter_by(shopee_item_id=str(item_id)).first()
+            if anuncio:
+                from controller.shopee_boost import get_br_now
+                anuncio.last_boost_at = get_br_now()
+                db.session.commit()
+
         return (
             jsonify({"status": "erro", "mensagem": f"Falha ao impulsionar: {msg}"}),
             400,
@@ -449,9 +498,7 @@ def get_boost_announcements():
         Anuncios.estoque_total >= 3
     )
 
-    # Se show_all for falso (padrão), removemos quem está com boost ativo
-    if not show_all:
-        query = query.filter(Anuncios.boost_end_at == None)
+    # Sempre inclui anúncios mesmo que estejam com boost ativo (boost_end_at != None)
     if search:
         query = query.filter(
             Anuncios.nome.ilike(f"%{search}%")
@@ -1216,18 +1263,69 @@ def update_price_api():
 @shopee_bp.route("/shopee/history", methods=["GET"])
 @token_required
 def get_shopee_history():
-    """Retorna os últimos 200 registros de alteração de preço do banco."""
+    """Retorna os registros de alteração de preço do banco com paginação e filtros."""
     from model.shopeeModel import HistoricoPreco, Usuario
 
     try:
-        registros = (
-            HistoricoPreco.query.order_by(HistoricoPreco.criado_em.desc())
-            .limit(200)
-            .all()
-        )
+        page = request.args.get("page", 1, type=int)
+        per_page = request.args.get("per_page", 20, type=int)
+        search = request.args.get("search", "")
+        status_filter = request.args.get("status", "all")
+        user_filter = request.args.get("user", "all")
+        date_filter = request.args.get("dateRange", "all")
+
+        query = HistoricoPreco.query
+
+        # Filtro de período/data
+        if date_filter != "all":
+            from datetime import timedelta
+            from model.shopeeModel import get_br_now
+            agora = get_br_now()
+
+            if date_filter == "today":
+                inicio = agora.replace(hour=0, minute=0, second=0, microsecond=0)
+                query = query.filter(HistoricoPreco.criado_em >= inicio)
+            elif date_filter == "yesterday":
+                inicio = (agora - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+                fim = (agora).replace(hour=0, minute=0, second=0, microsecond=0)
+                query = query.filter(HistoricoPreco.criado_em >= inicio, HistoricoPreco.criado_em < fim)
+            elif date_filter == "last7":
+                inicio = (agora - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
+                query = query.filter(HistoricoPreco.criado_em >= inicio)
+            elif date_filter == "last30":
+                inicio = (agora - timedelta(days=30)).replace(hour=0, minute=0, second=0, microsecond=0)
+                query = query.filter(HistoricoPreco.criado_em >= inicio)
+            elif date_filter == "thisMonth":
+                inicio = agora.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                query = query.filter(HistoricoPreco.criado_em >= inicio)
+
+        # Filtro de busca (nome, ID ou SKU)
+        if search:
+            query = query.filter(
+                HistoricoPreco.nome_produto.ilike(f"%{search}%")
+                | HistoricoPreco.shopee_item_id.ilike(f"%{search}%")
+                | HistoricoPreco.sku.ilike(f"%{search}%")
+            )
+
+        # Filtro de status
+        if status_filter != "all":
+            query = query.filter(HistoricoPreco.status == status_filter)
+
+        # Filtro de usuário
+        if user_filter != "all":
+            if user_filter == "Sistema":
+                query = query.filter(HistoricoPreco.usuario_id == None)
+            else:
+                query = query.join(Usuario, HistoricoPreco.usuario_id == Usuario.id).filter(Usuario.nome == user_filter)
+
+        # Ordenação decrescente por criado_em (mais novos primeiro)
+        query = query.order_by(HistoricoPreco.criado_em.desc())
+
+        # Paginação
+        pagination = query.paginate(page=page, per_page=per_page, error_out=False)
 
         resultado = []
-        for r in registros:
+        for r in pagination.items:
             usuario_nome = None
             if r.usuario_id:
                 u = Usuario.query.get(r.usuario_id)
@@ -1249,8 +1347,32 @@ def get_shopee_history():
                     "origem": r.origem,
                 }
             )
-        return jsonify(resultado), 200
+
+        # Busca usuários únicos que possuem registros de histórico
+        usuarios_com_historico = (
+            db.session.query(Usuario.nome)
+            .join(HistoricoPreco, HistoricoPreco.usuario_id == Usuario.id)
+            .distinct()
+            .all()
+        )
+        unique_users = [u[0] for u in usuarios_com_historico if u[0]]
+        
+        # Sempre adiciona "Sistema" se houver algum registro sem usuario_id
+        has_system_records = HistoricoPreco.query.filter(HistoricoPreco.usuario_id == None).first() is not None
+        if has_system_records:
+            unique_users.append("Sistema")
+
+        return jsonify({
+            "records": resultado,
+            "total_items": pagination.total,
+            "total_pages": pagination.pages,
+            "current_page": page,
+            "per_page": per_page,
+            "unique_users": unique_users
+        }), 200
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({"status": "erro", "mensagem": str(e)}), 500
 
 
@@ -1670,15 +1792,102 @@ def delete_discount_item_route(discount_id, item_id, model_id):
 @shopee_bp.route("/shopee/item/<string:item_id>", methods=["GET"])
 @token_required
 def get_item_info(item_id):
-    """Retorna informações de um item específico do banco local."""
+    """Retorna informações de um item específico do banco local enriquecido com dados da Shopee (imagens, descrição)."""
     from model.shopeeModel import Anuncios
+    from controller.auth.authShopee import TokenShopee
 
     try:
         anuncio = Anuncios.query.filter_by(shopee_item_id=item_id).first()
         if not anuncio:
             return jsonify({"status": "erro", "mensagem": "Item não encontrado"}), 404
-        return jsonify(anuncio.to_dict()), 200
+        
+        info_dict = anuncio.to_dict()
+        
+        # Tenta buscar imagens e descrição em tempo real da Shopee
+        try:
+            token_service = TokenShopee()
+            creds, error = token_service.ensure_valid_token()
+            if not error:
+                shopee_info = shopee_service._get_item_base_info(int(item_id), creds)
+                if shopee_info:
+                    info_dict["images"] = shopee_info.get("image", {}).get("image_url_list", [])
+                    info_dict["description"] = shopee_info.get("description", "")
+                    info_dict["category_id"] = shopee_info.get("category_id")
+                    info_dict["item_status"] = shopee_info.get("item_status")
+                    info_dict["brand"] = shopee_info.get("brand")
+        except Exception as e:
+            print(f"Erro ao enriquecer dados do item {item_id} da Shopee: {e}")
+            
+        return jsonify(info_dict), 200
     except Exception as e:
+        return jsonify({"status": "erro", "mensagem": str(e)}), 500
+
+
+@shopee_bp.route("/shopee/item/<string:item_id>", methods=["PUT"])
+@token_required
+def update_item_info(item_id):
+    """Atualiza as informações de um item no banco local (e tenta atualizar o nome na Shopee se possível)."""
+    from model.shopeeModel import Anuncios, db
+    from controller.auth.authShopee import TokenShopee
+
+    try:
+        anuncio = Anuncios.query.filter_by(shopee_item_id=item_id).first()
+        if not anuncio:
+            return jsonify({"status": "erro", "mensagem": "Item não encontrado"}), 404
+
+        dados = request.get_json()
+        novo_nome = dados.get("nome")
+        novo_sku = dados.get("sku")
+
+        if novo_nome:
+            anuncio.nome = novo_nome
+        if novo_sku is not None:
+            anuncio.sku_pai = novo_sku
+
+        # Salva local
+        db.session.commit()
+
+        # Opcional: Tenta atualizar na Shopee via API se estiver ativo
+        try:
+            token_service = TokenShopee()
+            creds, error = token_service.ensure_valid_token()
+            if not error and novo_nome:
+                path = "/api/v2/product/update_item"
+                payload = {
+                    "item_id": int(item_id),
+                    "item_name": novo_nome
+                }
+                shopee_service.request_shopee(path, creds, payload)
+        except Exception as e:
+            print(f"Erro ao atualizar nome do item {item_id} na Shopee: {e}")
+
+        return jsonify({"status": "sucesso", "mensagem": "Anúncio atualizado com sucesso", "item": anuncio.to_dict()}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"status": "erro", "mensagem": str(e)}), 500
+
+
+@shopee_bp.route("/shopee/item/<string:item_id>", methods=["DELETE"])
+@token_required
+def delete_item_info(item_id):
+    """Exclui um anúncio do banco local (permissão de admin obrigatória)."""
+    from model.shopeeModel import Anuncios, db
+
+    try:
+        # Apenas admins podem excluir anúncios
+        if not (hasattr(g, "current_user") and g.current_user and g.current_user.role == "admin"):
+            return jsonify({"status": "erro", "mensagem": "Permissão negada. Apenas administradores podem excluir anúncios."}), 403
+
+        anuncio = Anuncios.query.filter_by(shopee_item_id=item_id).first()
+        if not anuncio:
+            return jsonify({"status": "erro", "mensagem": "Item não encontrado"}), 404
+
+        db.session.delete(anuncio)
+        db.session.commit()
+
+        return jsonify({"status": "sucesso", "mensagem": "Anúncio excluído com sucesso do banco local"}), 200
+    except Exception as e:
+        db.session.rollback()
         return jsonify({"status": "erro", "mensagem": str(e)}), 500
 
 
