@@ -10,7 +10,7 @@ Isso elimina os erros:
 
 import os
 import sys
-from dotenv import load_dotenv
+from dotenv import load_dotenv  # pyrefly: ignore [missing-import]
 
 # 1. Carrega variáveis de ambiente ANTES de qualquer import pesado
 load_dotenv()
@@ -24,10 +24,10 @@ if backend_root not in sys.path:
     sys.path.insert(0, backend_root)
 
 # 4. Imports (nenhum deles puxa eventlet)
-from flask import Flask
-from flask_sqlalchemy import SQLAlchemy
-from rq import SimpleWorker
-from rq.timeouts import TimerDeathPenalty
+from flask import Flask  # pyrefly: ignore [missing-import]
+from flask_sqlalchemy import SQLAlchemy  # pyrefly: ignore [missing-import]
+from rq import SimpleWorker  # pyrefly: ignore [missing-import]
+from rq.timeouts import TimerDeathPenalty  # pyrefly: ignore [missing-import]
 from config.redis_config import redis_conn
 from model.shopeeModel import db          # Mesmo db do app principal
 

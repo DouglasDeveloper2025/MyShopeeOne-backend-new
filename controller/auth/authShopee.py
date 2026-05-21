@@ -214,6 +214,7 @@ def run_token_refresh_job():
     portanto NÃO devemos importar 'app' diretamente (isso puxaria eventlet e
     causaria BlockingIOError). Usamos current_app que já está disponível.
     """
+    # pyrefly: ignore [missing-import]
     from flask import current_app
     from model.shopeeModel import IntegracaoShopee
     from controller.auth.authShopee import TokenShopee

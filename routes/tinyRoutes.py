@@ -1,4 +1,4 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify  # pyrefly: ignore [missing-import]
 from model.shopeeModel import Produtos, Anuncios
 import json
 import logging

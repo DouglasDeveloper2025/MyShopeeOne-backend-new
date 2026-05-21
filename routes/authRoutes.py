@@ -1,4 +1,4 @@
-from flask import Blueprint, request, jsonify, render_template
+from flask import Blueprint, request, jsonify, render_template  # pyrefly: ignore [missing-import]
 import pandas as pd
 import io
 from model.shopeeModel import db, HistoricoPreco, IntegracaoShopee, Produtos

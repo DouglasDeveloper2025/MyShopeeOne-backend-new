@@ -1,11 +1,11 @@
-from flask import Blueprint, request, jsonify, redirect, g
-from sqlalchemy import or_
+from flask import Blueprint, request, jsonify, redirect, g  # pyrefly: ignore [missing-import]
+from sqlalchemy import or_  # pyrefly: ignore [missing-import]
 from datetime import datetime, timedelta
 import pandas as pd
 import io
 import re
 import requests
-from sqlalchemy.orm import joinedload, selectinload
+from sqlalchemy.orm import joinedload, selectinload  # pyrefly: ignore [missing-import]
 from controller.shopee_update.shopee_update_controller import ShopeeService
 from controller.shopee_boost import BoostController
 from controller.auth.authShopee import TokenShopee
@@ -539,7 +539,7 @@ def get_boost_announcements():
 @permission_required("view_boost")
 def get_boost_logs():
     """Retorna o histórico de logs de boost filtrado por impulsos ou erros."""
-    from sqlalchemy import or_
+    from sqlalchemy import or_  # pyrefly: ignore [missing-import]
 
     logs = (
         BoostLog.query.filter(
@@ -1481,7 +1481,7 @@ def search_discounts_by_product():
             return jsonify({"discount_list": [], "matched_products": {}}), 200
 
         from model.shopeeModel import Promocoes
-        from sqlalchemy import distinct
+        from sqlalchemy import distinct  # pyrefly: ignore [missing-import]
 
         search_str = f"%{search}%"
 

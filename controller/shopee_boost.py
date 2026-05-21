@@ -1,7 +1,7 @@
-from model.shopeeModel import db, Anuncios, BoostLog, Configuracoes, get_br_now
+from model.shopeeModel import db, Anuncios, Produtos, BoostLog, Configuracoes, get_br_now
 from utils.shopee_client import ShopeeClient
 from datetime import datetime, timedelta
-from sqlalchemy import or_
+from sqlalchemy import or_  # pyrefly: ignore [missing-import]
 import logging
 import random
 
@@ -28,18 +28,20 @@ class BoostController:
         agora = get_br_now()
 
         # 1. Reset status de quem não está mais na lista da Shopee E cujo prazo já venceu
+        # OU se o boost começou há mais de 3 minutos e ainda não aparece na lista da Shopee (limpeza de slots fantasmas)
         anuncios_ativos_db = Anuncios.query.filter(Anuncios.boost_end_at != None).all()
         for anuncio in anuncios_ativos_db:
-            # Se não está na lista da Shopee OU se o tempo já passou localmente
-            if anuncio.shopee_item_id not in boosted_ids and anuncio.boost_end_at <= agora:
-                anuncio.boost_end_at = None
-                self._log_boost(
-                    anuncio.shopee_item_id,
-                    "boost_expired",
-                    "info",
-                    f"Boost de '{anuncio.nome}' expirou e slot foi liberado.",
-                    anuncio.nome
-                )
+            if anuncio.shopee_item_id not in boosted_ids:
+                limite_propaga = agora + timedelta(minutes=237)
+                if anuncio.boost_end_at <= agora or anuncio.boost_end_at < limite_propaga:
+                    anuncio.boost_end_at = None
+                    self._log_boost(
+                        anuncio.shopee_item_id,
+                        "boost_expired",
+                        "info",
+                        f"Boost de '{anuncio.nome}' não está ativo na Shopee e slot foi liberado.",
+                        anuncio.nome
+                    )
 
         # 2. Atualiza status de quem está na lista vinda da API
         for item in boosted_items:
@@ -53,26 +55,75 @@ class BoostController:
 
         db.session.commit()
 
-        # 3. Reforço de Segurança: O número de slots ocupados será o MAIOR valor 
-        # entre o que a API relata e o que nosso banco de dados sabe que ainda não venceu.
-        # Isso impede tentativas duplicadas se a API falhar em retornar a lista.
-        ativos_locais = Anuncios.query.filter(Anuncios.boost_end_at > agora).count()
-        true_active_count = max(len(boosted_ids), ativos_locais)
+        # 3. Reforço de Segurança: O número de slots ocupados será a união dos IDs ativos na API
+        # com os IDs ativos localmente no nosso banco de dados (que ainda não propagaram na API).
+        # Isso impede tentativas duplicadas se a API falhar ou estiver com delay de propagação.
+        local_active_ids = [
+            anuncio.shopee_item_id 
+            for anuncio in Anuncios.query.filter(Anuncios.boost_end_at > agora).all() 
+            if anuncio.shopee_item_id
+        ]
+        all_active_ids = set(boosted_ids) | set(local_active_ids)
+        true_active_count = len(all_active_ids)
         
         return true_active_count
 
     def run_boost_cycle(self):
         """Lógica principal do Worker: Sincroniza, verifica slots e impulsiona o próximo."""
         from config.redis_config import redis_conn
+        
+        # Verifica se estamos em cooldown de limite de slots antes de adquirir o lock
+        try:
+            if redis_conn and redis_conn.get("shopee_boost_slot_limit_cooldown"):
+                logger.info("Ciclo de boost ignorado: Cooldown de limite de slots ativo (10 minutos).")
+                return "Slots cheios (cooldown)"
+        except Exception as e:
+            logger.warning(f"Erro ao verificar cooldown do Redis: {e}")
+
         lock = None
+        db_locked = False
         try:
             lock = redis_conn.lock("shopee_boost_cycle_lock", timeout=600, blocking_timeout=1)
             if not lock.acquire(blocking=False):
                 logger.warning("Ciclo de boost já está em andamento. Ignorando execução sobreposta.")
                 return "Já em andamento"
+            
+            # Verifica e define o timestamp da última execução para evitar duplicidade
+            try:
+                import time
+                last_run = redis_conn.get("shopee_boost_last_run_timestamp")
+                if last_run:
+                    last_run_time = float(last_run)
+                    if time.time() - last_run_time < 45: # 45 segundos de intervalo mínimo
+                        logger.info("Ciclo de boost ignorado para evitar execução em duplicidade (intervalo menor que 45s).")
+                        try:
+                            lock.release()
+                        except Exception:
+                            pass
+                        return "Ignorado (duplicidade/concorrência)"
+                redis_conn.setex("shopee_boost_last_run_timestamp", 300, str(time.time()))
+            except Exception as rex:
+                logger.warning(f"Erro ao verificar/definir timestamp de execução no Redis: {rex}")
         except Exception as e:
             logger.warning(f"Aviso Redis Lock: {e}")
             lock = None
+
+        # Adquire lock de banco adicional para garantir mutual exclusion absoluta
+        from sqlalchemy import text
+        if db.engine.dialect.name == "postgresql":
+            try:
+                result = db.session.execute(text("SELECT pg_try_advisory_lock(888888)"))
+                db_locked = result.scalar()
+                if not db_locked:
+                    logger.warning("Ciclo de boost bloqueado por advisory lock no Postgres (execução concorrente).")
+                    if lock:
+                        try:
+                            lock.release()
+                        except Exception:
+                            pass
+                    return "Já em andamento"
+            except Exception as dberr:
+                logger.warning(f"Erro ao tentar adquirir advisory lock no banco: {dberr}")
 
         try:
             active_count = self.sync_boost_status()
@@ -172,17 +223,85 @@ class BoostController:
                         candidate.nome,
                     )
                     
+                    # Trata erro de item status not normal ou estoque zerado na shopee
+                    if "item status not normal" in msg.lower() or "stock is 0" in msg.lower():
+                        anuncio_db = Anuncios.query.filter_by(shopee_item_id=candidate.shopee_item_id).first()
+                        if anuncio_db:
+                            anuncio_db.boost_enabled = False
+                            if anuncio_db.status in ["NORMAL", "ATIVO"]:
+                                anuncio_db.status = "UNLIST"
+                            anuncio_db.estoque_total = 0
+                            
+                            # Atualiza as variações correspondentes
+                            variacoes = Produtos.query.filter_by(shopee_item_id=anuncio_db.shopee_item_id).all()
+                            if len(variacoes) == 1 and variacoes[0].shopee_model_id == "0":
+                                # Produto simples (sem variações reais)
+                                variacoes[0].estoque = 0
+                                variacoes[0].situacao = "UNLIST"
+                                logger.info(f"Produto simples {anuncio_db.nome} atualizado para estoque 0 e UNLIST.")
+                            else:
+                                # Produto com variações
+                                try:
+                                    try:
+                                        item_id_int = int(anuncio_db.shopee_item_id)
+                                    except (ValueError, TypeError):
+                                        item_id_int = 0
+
+                                    if item_id_int > 0:
+                                        model_resp = self.client.request(
+                                            "GET",
+                                            "/api/v2/product/get_model_list",
+                                            params={"item_id": item_id_int}
+                                        )
+                                    else:
+                                        model_resp = {"error": "Invalid item ID"}
+                                    if model_resp and not model_resp.get("error"):
+                                        models_list = model_resp.get("response", {}).get("model", [])
+                                        updated_vars = []
+                                        for m in models_list:
+                                            mid = str(m.get("model_id"))
+                                            m_stock_v2 = m.get("stock_info_v2", {})
+                                            stock = m_stock_v2.get("summary_info", {}).get("total_available_stock", 0)
+                                            if stock == 0:
+                                                # Encontra variação local
+                                                local_var = next((v for v in variacoes if v.shopee_model_id == mid), None)
+                                                if local_var:
+                                                    local_var.estoque = 0
+                                                    local_var.situacao = "UNLIST"
+                                                    updated_vars.append(mid)
+                                        logger.info(f"Variacoes com estoque zerado atualizadas localmente: {updated_vars}")
+                                    else:
+                                        logger.error(f"Erro ao buscar get_model_list da Shopee para {anuncio_db.shopee_item_id}: {model_resp}")
+                                except Exception as err:
+                                    logger.error(f"Exceção ao buscar/atualizar variações de boost para {anuncio_db.shopee_item_id}: {err}")
+                            
+                            db.session.commit()
+                            self._log_boost(
+                                anuncio_db.shopee_item_id,
+                                "boost_disabled",
+                                "info",
+                                f"Impulsionamento pausado e estoque zerado/status alterado para UNLIST devido ao erro: {msg}",
+                                anuncio_db.nome
+                            )
+                    
                     # Trata erro de cooldown de 240min (do not bump same product under 240min)
-                    if "240min" in msg.lower() or "cooldown" in msg.lower() or "under 240" in msg.lower():
+                    elif "240min" in msg.lower() or "cooldown" in msg.lower() or "under 240" in msg.lower():
                         candidate.last_boost_at = get_br_now()
+                        db.session.commit()
                     
                     # Trata erro de limite de slots (reached shop's bump slot limit)
-                    if "limit" in msg.lower() or "limite" in msg.lower() or "slot" in msg.lower():
+                    elif "limit" in msg.lower() or "limite" in msg.lower() or "slot" in msg.lower():
                         logger.warning(f"Limite de slots atingido na Shopee ao tentar impulsionar {candidate.nome}. Interrompendo loop.")
+                        try:
+                            redis_conn.setex("shopee_boost_slot_limit_cooldown", 600, "1")
+                            logger.info("Definido cooldown de 10 minutos para limite de slots no Redis.")
+                        except Exception as rex:
+                            logger.warning(f"Erro ao definir cooldown de limite de slots no Redis: {rex}")
                         break
                 else:
                     candidate.last_boost_at = get_br_now()
                     candidate.boost_end_at = get_br_now() + timedelta(hours=4)
+                    db.session.commit()
                     self._log_boost(
                         candidate.shopee_item_id,
                         "boost_start",
@@ -206,6 +325,13 @@ class BoostController:
             return f"Erro: {str(e)}"
         
         finally:
+            if db_locked and db.engine.dialect.name == "postgresql":
+                try:
+                    from sqlalchemy import text
+                    db.session.execute(text("SELECT pg_advisory_unlock(888888)"))
+                    db.session.commit()
+                except Exception as dberr:
+                    logger.warning(f"Erro ao tentar liberar advisory lock no banco: {dberr}")
             if lock:
                 try:
                     lock.release()
@@ -282,7 +408,7 @@ class BoostController:
 
 def run_boost_job():
     """Job a ser chamado pelo Worker/Scheduler."""
-    from flask import current_app
+    from flask import current_app  # pyrefly: ignore [missing-import]
 
     # O current_app já tem o contexto no worker
     controller = BoostController()

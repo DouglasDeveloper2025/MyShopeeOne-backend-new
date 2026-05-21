@@ -1,7 +1,7 @@
-from flask_sqlalchemy import SQLAlchemy
+from flask_sqlalchemy import SQLAlchemy  # pyrefly: ignore [missing-import]
 from datetime import datetime
 import pytz
-import bcrypt
+import bcrypt  # pyrefly: ignore [missing-import]
 
 # Fuso horário padrão
 tz_br = pytz.timezone("America/Sao_Paulo")

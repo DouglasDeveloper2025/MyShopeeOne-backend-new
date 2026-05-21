@@ -1,6 +1,6 @@
 import os
-from redis import Redis
-from rq import Queue
+from redis import Redis  # pyrefly: ignore [missing-import]
+from rq import Queue  # pyrefly: ignore [missing-import]
 
 # Configuração de conexão com o Redis
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")

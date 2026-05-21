@@ -9,8 +9,13 @@ from datetime import datetime, timedelta
 import pytz
 import math
 from controller.auth.authShopee import TokenShopee
-from sqlalchemy import or_
+from sqlalchemy import or_  # pyrefly: ignore [missing-import]
 from model.shopeeModel import db, HistoricoPreco, Produtos, Anuncios, Configuracoes
+
+
+class SyncCancelledException(Exception):
+    """Custom exception raised when synchronization is cancelled by the user."""
+    pass
 
 
 class ShopeeService:
@@ -206,20 +211,16 @@ class ShopeeService:
             )
 
             for i in range(0, total, BATCH_SIZE):
+                current_batch_num = (i // BATCH_SIZE) + 1
                 # Verificar cancelamento via Redis (Checagem mais frequente)
                 cancel_signal = redis_conn.get("shopee_sync_cancel")
                 if cancel_signal:
                     print(
                         f"--- [SYNC] CANCELAMENTO DETECTADO no Lote {current_batch_num}. Parando... ---"
                     )
-                    self._update_sync_status(
-                        is_running=False,
-                        mensagem="Sincronização interrompida pelo usuário.",
-                    )
-                    return
+                    raise SyncCancelledException("Sincronização cancelada pelo usuário.")
 
                 batch_ids = item_ids[i : i + BATCH_SIZE]
-                current_batch_num = (i // BATCH_SIZE) + 1
                 print(
                     f"--- [DEBUG] Lote {current_batch_num}: Processando {len(batch_ids)} IDs ---"
                 )
@@ -229,7 +230,7 @@ class ShopeeService:
 
                     # Verificação dupla após a chamada da API (que é o que mais demora)
                     if redis_conn.get("shopee_sync_cancel"):
-                        return
+                        raise SyncCancelledException("Sincronização cancelada pelo usuário.")
 
                     # Atualização atômica de progresso
                     prog = self.get_sync_progress()
@@ -242,6 +243,8 @@ class ShopeeService:
                     print(
                         f"--- [DEBUG] Lote {current_batch_num} OK: {res_batch.get('sucessos')} sucessos ---"
                     )
+                except SyncCancelledException as e_cancel:
+                    raise e_cancel
                 except Exception as e_batch:
                     print(f"❌ Erro no lote {current_batch_num}: {e_batch}")
                     prog = self.get_sync_progress()
@@ -261,6 +264,14 @@ class ShopeeService:
             # Verificar desbloqueios de 15 dias após sincronizar
             self.verificar_desbloqueios(item_ids)
 
+        except SyncCancelledException as e:
+            print(f"--- [SYNC] Lógica de sincronização interrompida devido ao cancelamento: {e} ---")
+            self._update_sync_status(
+                is_running=False,
+                mensagem="Cancelado pelo usuário.",
+            )
+            redis_conn.delete("shopee_sync_cancel")
+            raise e
         except Exception as e:
             print(f"❌ Erro no worker: {e}")
             self._update_sync_status(is_running=False, mensagem=f"Erro: {str(e)}")
@@ -310,16 +321,7 @@ class ShopeeService:
                 from config.redis_config import redis_conn
 
                 if self.cancel_requested or redis_conn.get("shopee_sync_cancel"):
-                    self.sync_status.update(
-                        {
-                            "is_running": False,
-                            "mensagem": "Sincronização cancelada pelo usuário.",
-                        }
-                    )
-                    # Limpar flag local e no redis
-                    self.cancel_requested = False
-                    redis_conn.delete("shopee_sync_cancel")
-                    return
+                    raise SyncCancelledException("Sincronização cancelada pelo usuário.")
 
                 batch_ids = item_ids[i : i + BATCH_SIZE]
                 self.sync_status["atual"] = min(i + len(batch_ids), len(item_ids))
@@ -329,6 +331,8 @@ class ShopeeService:
                     res_batch = self.sync_batch_from_shopee(batch_ids, creds)
                     self.sync_status["sucessos"] += res_batch.get("sucessos", 0)
                     self.sync_status["erros"] += res_batch.get("erros", 0)
+                except SyncCancelledException as e_cancel:
+                    raise e_cancel
                 except Exception as e_batch:
                     print(f"❌ Erro fatal no lote {i//BATCH_SIZE + 1}: {str(e_batch)}")
                     self.sync_status["erros"] += len(batch_ids)
@@ -346,6 +350,15 @@ class ShopeeService:
             # --- NOVO: Verificar desbloqueios de 15 dias após sincronizar ---
             self.verificar_desbloqueios(item_ids)
 
+        except SyncCancelledException as e:
+            self.sync_status.update(
+                {
+                    "is_running": False,
+                    "mensagem": "Cancelado pelo usuário.",
+                }
+            )
+            self._update_sync_status(is_running=False, mensagem="Cancelado pelo usuário.")
+            self._safe_emit("sync_finished", {"sucesso": False, "erro": "Cancelado pelo usuário."})
         except Exception as e:
             error_msg = str(e)
             self.sync_status.update(
@@ -359,7 +372,7 @@ class ShopeeService:
             self._safe_emit("sync_finished", {"sucesso": False, "erro": error_msg})
         finally:
             # Emitir sucesso se não caiu no except crítico
-            if not self.sync_status.get("error_critical"):
+            if not self.sync_status.get("error_critical") and not self.sync_status.get("mensagem") == "Cancelado pelo usuário.":
                 self._safe_emit(
                     "sync_finished",
                     {
@@ -374,15 +387,22 @@ class ShopeeService:
     def sync_batch_from_shopee(self, item_id_list, creds):
         """Sincroniza um lote de itens da Shopee de forma eficiente."""
         from model.shopeeModel import Anuncios, Produtos
+        from config.redis_config import redis_conn
 
         stats = {"sucessos": 0, "erros": 0}
         agora = self._get_brasilia_time()
 
         try:
+            if redis_conn.get("shopee_sync_cancel"):
+                raise SyncCancelledException("Sincronização cancelada pelo usuário.")
+
             # 1. Buscar Info Base em Lote
             items_info = self._get_item_base_info_batch(item_id_list, creds)
             if not items_info:
                 return {"sucessos": 0, "erros": len(item_id_list)}
+
+            if redis_conn.get("shopee_sync_cancel"):
+                raise SyncCancelledException("Sincronização cancelada pelo usuário.")
 
             # 2. Buscar Promoções em Lote
             promos_all = self._get_active_promotion_batch(item_id_list, creds)
@@ -390,6 +410,9 @@ class ShopeeService:
             # Mapear promos por item_id para busca rápida
             promo_map = {str(p["item_id"]): p.get("promotion", []) for p in promos_all}
             for info in items_info:
+                if redis_conn.get("shopee_sync_cancel"):
+                    raise SyncCancelledException("Sincronização cancelada pelo usuário.")
+
                 iid = str(info["item_id"])
                 try:
                     # Garantir Anúncio (Pai)
@@ -576,6 +599,8 @@ class ShopeeService:
                         anuncio.updated_at = agora
 
                     stats["sucessos"] += 1
+                except SyncCancelledException as e_cancel:
+                    raise e_cancel
                 except Exception as e_item:
                     print(f"⚠️ Erro ao processar item {iid} no batch: {e_item}")
                     stats["erros"] += 1
@@ -600,6 +625,9 @@ class ShopeeService:
                 pass
 
             return stats
+        except SyncCancelledException as e_cancel:
+            db.session.rollback()
+            raise e_cancel
         except Exception as e_batch:
             db.session.rollback()
             print(f"❌ Erro crítico no sync_batch_from_shopee: {e_batch}")
@@ -656,17 +684,11 @@ class ShopeeService:
             while has_next_page:
                 # Verificar cancelamento via Redis
                 cancel_signal = redis_conn.get("shopee_sync_cancel")
-                if (
-                    cancel_signal
-                ):  # Checagem simplificada (qualquer valor no Redis cancela)
+                if cancel_signal:
                     print(
                         "--- [SYNC] Cancelamento detectado durante busca de IDs. Interrompendo... ---"
                     )
-                    self._update_sync_status(
-                        is_running=False,
-                        mensagem="Cancelado durante busca de anúncios.",
-                    )
-                    return item_ids
+                    raise SyncCancelledException("Sincronização cancelada pelo usuário.")
 
                 params = {
                     "offset": offset,
@@ -873,6 +895,7 @@ class ShopeeService:
             # Auto-detectar usuario_id do contexto Flask se não fornecido
             if usuario_id is None:
                 try:
+                    # pyrefly: ignore [missing-import]
                     from flask import g
 
                     if hasattr(g, "current_user") and g.current_user:
@@ -2271,7 +2294,7 @@ class ShopeeService:
                     ]
 
                     if to_clear_ids:
-                        from sqlalchemy import update
+                        from sqlalchemy import update  # pyrefly: ignore [missing-import]
 
                         db.session.query(Produtos).filter(
                             Produtos.id.in_(to_clear_ids)
@@ -2303,7 +2326,7 @@ class ShopeeService:
 
         # 2. Busca no Banco Local (Após sincronização ou para páginas subsequentes)
         flat_items = []
-        from sqlalchemy import or_
+        from sqlalchemy import or_  # pyrefly: ignore [missing-import]
 
         query = (
             db.session.query(Produtos, Anuncios.nome)
@@ -2549,7 +2572,7 @@ class ShopeeService:
                             p.preco_promocional = price
 
                             # Logar no Histórico
-                            from flask import g
+                            from flask import g  # pyrefly: ignore [missing-import]
 
                             u_id = (
                                 getattr(g, "current_user", None).id
@@ -2580,7 +2603,7 @@ class ShopeeService:
                         p.preco_promocional = price
 
                         # Logar no Histórico
-                        from flask import g
+                        from flask import g  # pyrefly: ignore [missing-import]
 
                         u_id = (
                             getattr(g, "current_user", None).id
@@ -2658,7 +2681,7 @@ class ShopeeService:
                         ).first()
                         if p:
                             p.preco_promocional = price
-                            from flask import g
+                            from flask import g  # pyrefly: ignore [missing-import]
 
                             u_id = (
                                 getattr(g, "current_user", None).id
@@ -2686,7 +2709,7 @@ class ShopeeService:
                     ).first()
                     if p:
                         p.preco_promocional = price
-                        from flask import g
+                        from flask import g  # pyrefly: ignore [missing-import]
 
                         u_id = (
                             getattr(g, "current_user", None).id
@@ -2846,6 +2869,11 @@ def run_full_sync_job():
         print("--- [RQ JOB] Revalidando travas de atualização ---")
         service.revalidate_all_locks()
 
+    except SyncCancelledException as e:
+        print(f"--- [RQ INFO] Sincronização cancelada pelo usuário: {str(e)} ---")
+        service._update_sync_status(
+            is_running=False, mensagem="Cancelado pelo usuário."
+        )
     except Exception as e:
         import traceback
 

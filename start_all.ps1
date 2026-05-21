@@ -13,8 +13,8 @@ Start-Process powershell -ArgumentList "-NoExit", "-Command", "& '.\.venv\Script
 Write-Host "[2/3] Iniciando RQ Worker..." -ForegroundColor Green
 Start-Process powershell -ArgumentList "-NoExit", "-Command", "& '.\.venv\Scripts\Activate.ps1'; python config/worker.py"
 
-Write-Host "[3/3] Iniciando RQ Dashboard..." -ForegroundColor Green
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "& '.\.venv\Scripts\Activate.ps1'; rq-dashboard"
+# Write-Host "[3/3] Iniciando RQ Dashboard..." -ForegroundColor Green
+# Start-Process powershell -ArgumentList "-NoExit", "-Command", "& '.\.venv\Scripts\Activate.ps1'; rq-dashboard"
 
 Write-Host "`nTodos os servicos foram lancados!" -ForegroundColor Yellow
 pause

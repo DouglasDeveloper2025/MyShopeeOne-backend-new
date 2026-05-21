@@ -1,11 +1,11 @@
-import eventlet
+import eventlet  # pyrefly: ignore [missing-import]
 
 # Força o patch de forma agressiva para tentar capturar locks residuais
 eventlet.monkey_patch()
 
 # Garante que o psycopg2 seja greened corretamente para evitar erros de SSL
 try:
-    from eventlet.support import psycopg2_patcher
+    from eventlet.support import psycopg2_patcher  # pyrefly: ignore [missing-import]
 
     psycopg2_patcher.make_psycopg_green()
 except ImportError:
@@ -13,7 +13,7 @@ except ImportError:
 
 import sys
 import os
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, send_from_directory  # pyrefly: ignore [missing-import]
 from flask_cors import CORS
 from model.shopeeModel import db
 from routes.shopeeRoutes import shopee_bp
@@ -21,6 +21,7 @@ from routes.authRoutes import auth_bp
 from routes.userRoutes import user_bp
 from routes.tinyRoutes import tiny_bp
 from flask_socketio import SocketIO
+# pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
 
 # Carrega variáveis de ambiente
