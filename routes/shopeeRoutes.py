@@ -812,6 +812,16 @@ def get_sync_progress():
     return jsonify(res), 200
 
 
+@shopee_bp.route("/shopee/sync-last", methods=["GET"])
+@token_required
+def get_last_sync_log():
+    from model.shopeeModel import SyncLog
+    last_log = SyncLog.query.order_by(SyncLog.id.desc()).first()
+    if not last_log:
+        return jsonify(None), 200
+    return jsonify(last_log.to_dict()), 200
+
+
 @shopee_bp.route("/shopee/cancel-sync", methods=["GET", "POST"])
 @token_required
 def cancel_sync():
@@ -828,8 +838,9 @@ def sync_item(item_id):
     if res["status"] == "erro":
         return jsonify(res), 400
 
-    # Buscar o item atualizado para retornar
-    item = Anuncios.query.filter_by(shopee_item_id=str(item_id)).first()
+    # Buscar o item atualizado para retornar (se for convertido, usa o ID real retornado)
+    real_id = res.get("item_ids", [item_id])[0] if res.get("item_ids") else item_id
+    item = Anuncios.query.filter_by(shopee_item_id=str(real_id)).first()
     if item:
         from model.shopeeModel import Configuracoes
 

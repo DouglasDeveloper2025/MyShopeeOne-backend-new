@@ -53,8 +53,18 @@ class ShopeeClient:
         }
 
         if use_auth:
-            access_token = self.integracao.last_access_token
-            shop_id = int(self.integracao.shop_id)
+            # Garante que o token de acesso seja válido antes de realizar a requisição
+            from controller.auth.authShopee import TokenShopee
+            tokens_service = TokenShopee()
+            creds, err = tokens_service.ensure_valid_token(self.integracao.id)
+            if err:
+                logger.error(f"Erro ao validar/renovar token Shopee antes da requisição: {err}")
+                access_token = self.integracao.last_access_token
+                shop_id = int(self.integracao.shop_id)
+            else:
+                access_token = creds["access_token"]
+                shop_id = int(creds["shop_id"])
+
             common_params["access_token"] = access_token
             common_params["shop_id"] = shop_id
             sign = self._generate_sign(path, timestamp, access_token, shop_id)
@@ -79,10 +89,31 @@ class ShopeeClient:
                 data = response.json()
                 
                 # Trata expiração de token (error_token ou similar conforme Shopee API)
-                if data.get("error") in ["error_auth", "error_param", "error_token"]:
-                    # Se for erro de token, poderíamos tentar renovar aqui, 
-                    # mas o background_checker já faz isso.
+                if data.get("error") in ["error_auth", "error_param", "error_token", "invalid_acceess_token", "invalid_access_token"]:
                     logger.warning(f"Shopee API Auth Error: {data}")
+                    # Se obtivermos erro de token, forçamos um refresh e tentamos novamente
+                    if use_auth and attempt < retries:
+                        logger.info("Forçando a renovação do token Shopee após erro de autenticação...")
+                        from controller.auth.authShopee import TokenShopee
+                        tokens_service = TokenShopee()
+                        
+                        # Recarrega o objeto do banco para evitar conflitos/dados obsoletos
+                        db.session.refresh(self.integracao)
+                        
+                        creds, err = tokens_service._refresh_token(self.integracao)
+                        if not err and creds:
+                            logger.info("Token renovado com sucesso. Atualizando parâmetros e tentando novamente...")
+                            access_token = creds["access_token"]
+                            shop_id = int(creds["shop_id"])
+                            
+                            common_params["access_token"] = access_token
+                            common_params["shop_id"] = shop_id
+                            
+                            # Recalcula a assinatura e timestamp para evitar problemas de assinatura expirada
+                            new_timestamp = int(time.time())
+                            common_params["timestamp"] = new_timestamp
+                            common_params["sign"] = self._generate_sign(path, new_timestamp, access_token, shop_id)
+                            continue
                 
                 return data
             except Exception as e:

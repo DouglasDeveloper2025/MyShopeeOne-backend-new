@@ -1,5 +1,5 @@
 from flask import Blueprint, request, jsonify  # pyrefly: ignore [missing-import]
-from model.shopeeModel import Produtos, Anuncios
+from controller.tinyController import TinyController
 import json
 import logging
 
@@ -9,79 +9,66 @@ logger = logging.getLogger(__name__)
 
 @tiny_bp.route("/tiny/webhook", methods=["POST", "GET"])
 def tiny_webhook():
-    # Tenta pegar os dados como JSON
-    dados = request.get_json(force=True, silent=True)
+    print("Webhook Tiny recebido", request.data)
+    # Checagem simples para requisições GET
+    if request.method == "GET":
+        return jsonify({"status": "sucesso", "mensagem": "Webhook Tiny ativo."}), 200
 
-    # Se falhar, pega como texto bruto
+    import os
+    import json
+    
+    # Captura os dados brutos e headers para depuração
+    headers = dict(request.headers)
+    form_data = dict(request.form)
+    json_data = request.get_json(force=True, silent=True)
+    raw_data = ""
+    try:
+        raw_data = request.data.decode("utf-8") if request.data else ""
+    except Exception as e:
+        raw_data = f"Error decoding request.data: {e}"
+
+    # Salva em um arquivo de log para depuração
+    log_info = {
+        "content_type": request.content_type,
+        "headers": headers,
+        "form": form_data,
+        "json": json_data,
+        "raw_data": raw_data
+    }
+    
+    log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "last_webhook_payload.json")
+    try:
+        with open(log_path, "w", encoding="utf-8") as f:
+            json.dump(log_info, f, indent=4, ensure_ascii=False)
+        logger.info(f"Webhook gravado com sucesso em {log_path}")
+    except Exception as log_err:
+        logger.error(f"Erro ao gravar log do webhook: {log_err}")
+
+    # Processamento robusto dos dados recebidos
+    dados = json_data
+
+    # Fallback para request.form['dados'] se for enviado via form-urlencoded com parâmetro dados
     if dados is None:
-        try:
-            dados = json.loads(request.data.decode("utf-8"))
-        except:
-            dados = request.data.decode("utf-8")
-
-    print(dados)
-
-    if isinstance(dados, dict) and dados.get("tipo") == "produto":
-        produto_dados = dados.get("dados", {})
-        sku = produto_dados.get("codigo")
-
-        if sku:
-            print(f"\n[Tiny ERP] Produto detectado. SKU (codigo): {sku}")
-            print("[Tiny ERP] Buscando anuncios correspondentes")
-
+        if form_data and "dados" in form_data:
             try:
-                produtos_existentes = Produtos.query.filter(Produtos.sku == sku).all()
-                anuncios_existentes = Anuncios.query.filter(
-                    Anuncios.sku_pai == sku
-                ).all()
-
-                item_ids_encontrados = set()
-
-                for p in produtos_existentes:
-                    item_ids_encontrados.add(p.shopee_item_id)
-
-                for a in anuncios_existentes:
-                    item_ids_encontrados.add(a.shopee_item_id)
-
-                if item_ids_encontrados:
-                    print(
-                        f"[Shopee Check] Anúncios JÁ EXISTENTES encontrados para o SKU '{sku}'. Item IDs: {list(item_ids_encontrados)}"
-                    )
-                    print(
-                        "[Ação] Inspeção falhou: O anúncio já existe na Shopee. Ignorando a criação."
-                    )
-                    return (
-                        jsonify(
-                            {
-                                "status": "sucesso",
-                                "mensagem": "Anúncio já existe",
-                                "recebido": True,
-                            }
-                        ),
-                        200,
-                    )
-                else:
-                    print(
-                        f"[Shopee Check] Nenhum anúncio encontrado para o SKU '{sku}'."
-                    )
-                    print(
-                        "[Ação] Inspeção passou: O anúncio não existe na Shopee e pode ser aplicado/criado."
-                    )
-
-                    # AQUI: Inserir a logica de criacao do anuncio na Shopee (se necessario futuramente)
-                    return (
-                        jsonify(
-                            {
-                                "status": "sucesso",
-                                "mensagem": "Produto apto para criação",
-                                "recebido": True,
-                            }
-                        ),
-                        200,
-                    )
-
+                dados = json.loads(form_data.get("dados"))
             except Exception as e:
-                print(f"[Erro] Falha ao acessar banco de dados da Shopee: {e}")
-                return jsonify({"status": "erro", "mensagem": str(e)}), 500
+                logger.warning(f"Erro ao decodificar JSON de request.form['dados']: {e}")
+        elif form_data:
+            dados = form_data
+        else:
+            try:
+                dados = json.loads(raw_data) if raw_data else None
+            except:
+                dados = raw_data
 
-    return jsonify({"status": "sucesso", "recebido": True}), 200
+    # Delega a lógica de negócio para o TinyController
+    controller = TinyController()
+    resultado, status_code = controller.process_webhook(dados)
+
+    # O ERP Tiny exige HTTP 200 em todas as respostas de webhook para evitar sinalização de falha de envio.
+    # Portanto, mesmo se ocorrer um erro de validação ou processamento (que retornaria 400 ou 500),
+    # respondemos com HTTP 200 para a API do Tiny.
+    return jsonify(resultado), 200

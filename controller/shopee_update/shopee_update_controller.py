@@ -5,12 +5,15 @@ import os
 import requests
 import json
 import re
+import logging
 from datetime import datetime, timedelta
 import pytz
 import math
 from controller.auth.authShopee import TokenShopee
 from sqlalchemy import or_  # pyrefly: ignore [missing-import]
 from model.shopeeModel import db, HistoricoPreco, Produtos, Anuncios, Configuracoes
+
+logger = logging.getLogger(__name__)
 
 
 class SyncCancelledException(Exception):
@@ -46,7 +49,7 @@ class ShopeeService:
             import os
 
             if os.environ.get("IS_RQ_WORKER") == "true":
-                # No worker, não temos SocketIO — apenas loga
+                # No worker, nao temos SocketIO - apenas loga
                 print(f"[RQ Worker] SocketIO emit ignorado: {event}")
                 return
             from app import socketio
@@ -246,7 +249,7 @@ class ShopeeService:
                 except SyncCancelledException as e_cancel:
                     raise e_cancel
                 except Exception as e_batch:
-                    print(f"❌ Erro no lote {current_batch_num}: {e_batch}")
+                    print(f"[ERRO] Erro no lote {current_batch_num}: {e_batch}")
                     prog = self.get_sync_progress()
                     prog["erros"] += len(batch_ids)
                     prog["atual"] = min(i + len(batch_ids), total)
@@ -273,7 +276,7 @@ class ShopeeService:
             redis_conn.delete("shopee_sync_cancel")
             raise e
         except Exception as e:
-            print(f"❌ Erro no worker: {e}")
+            print(f"[ERRO] Erro no worker: {e}")
             self._update_sync_status(is_running=False, mensagem=f"Erro: {str(e)}")
 
     def _run_sync_worker(self, app):
@@ -334,7 +337,7 @@ class ShopeeService:
                 except SyncCancelledException as e_cancel:
                     raise e_cancel
                 except Exception as e_batch:
-                    print(f"❌ Erro fatal no lote {i//BATCH_SIZE + 1}: {str(e_batch)}")
+                    print(f"[ERRO] Erro fatal no lote {i//BATCH_SIZE + 1}: {str(e_batch)}")
                     self.sync_status["erros"] += len(batch_ids)
 
                 # Pequena pausa para evitar overstrain nos buffers locais, mas muito mais rápido que o loop individual
@@ -350,6 +353,12 @@ class ShopeeService:
             # --- NOVO: Verificar desbloqueios de 15 dias após sincronizar ---
             self.verificar_desbloqueios(item_ids)
 
+            # Salvar log no banco
+            _save_sync_log(
+                total_sincronizados=self.sync_status["sucessos"],
+                erro=f"{self.sync_status['erros']} erro(s) durante a sincronização." if self.sync_status["erros"] > 0 else None
+            )
+
         except SyncCancelledException as e:
             self.sync_status.update(
                 {
@@ -359,6 +368,10 @@ class ShopeeService:
             )
             self._update_sync_status(is_running=False, mensagem="Cancelado pelo usuário.")
             self._safe_emit("sync_finished", {"sucesso": False, "erro": "Cancelado pelo usuário."})
+            _save_sync_log(
+                total_sincronizados=self.sync_status.get("sucessos", 0),
+                erro="Cancelado pelo usuário."
+            )
         except Exception as e:
             error_msg = str(e)
             self.sync_status.update(
@@ -370,6 +383,10 @@ class ShopeeService:
             )
             # Emitir falha
             self._safe_emit("sync_finished", {"sucesso": False, "erro": error_msg})
+            _save_sync_log(
+                total_sincronizados=self.sync_status.get("sucessos", 0),
+                erro=f"Erro crítico: {error_msg}"
+            )
         finally:
             # Emitir sucesso se não caiu no except crítico
             if not self.sync_status.get("error_critical") and not self.sync_status.get("mensagem") == "Cancelado pelo usuário.":
@@ -418,14 +435,30 @@ class ShopeeService:
                     # Garantir Anúncio (Pai)
                     anuncio = Anuncios.query.filter_by(shopee_item_id=iid).first()
                     if not anuncio:
-                        anuncio = Anuncios(
-                            shopee_item_id=iid,
-                            nome=info.get("item_name"),
-                            sku_pai=info.get("item_sku"),
-                            status=info.get("item_status", "NORMAL"),
-                        )
-                        db.session.add(anuncio)
-                        db.session.flush()
+                        # Se não encontrar por item_id, busca por sku_pai onde o shopee_item_id começa com 'TINY_'
+                        # para converter o anúncio virtual do ERP em anúncio real da Shopee.
+                        sku_pai_val = info.get("item_sku")
+                        if sku_pai_val:
+                            anuncio = Anuncios.query.filter(
+                                Anuncios.sku_pai == sku_pai_val,
+                                Anuncios.shopee_item_id.like("TINY_%")
+                            ).first()
+                        
+                        if anuncio:
+                            logger.info(f"[Sync] Convertendo anúncio virtual {anuncio.shopee_item_id} para ID Shopee real {iid}")
+                            for p_var in anuncio.variacoes:
+                                p_var.shopee_item_id = iid
+                            anuncio.shopee_item_id = iid
+                            db.session.flush()
+                        else:
+                            anuncio = Anuncios(
+                                shopee_item_id=iid,
+                                nome=info.get("item_name"),
+                                sku_pai=info.get("item_sku"),
+                                status=info.get("item_status", "NORMAL"),
+                            )
+                            db.session.add(anuncio)
+                            db.session.flush()
                     else:
                         anuncio.nome = info.get("item_name", anuncio.nome)
                         anuncio.sku_pai = info.get("item_sku", anuncio.sku_pai)
@@ -602,7 +635,7 @@ class ShopeeService:
                 except SyncCancelledException as e_cancel:
                     raise e_cancel
                 except Exception as e_item:
-                    print(f"⚠️ Erro ao processar item {iid} no batch: {e_item}")
+                    print(f"[AVISO] Erro ao processar item {iid} no batch: {e_item}")
                     stats["erros"] += 1
                     # Registrar erro de processamento individual no histórico
                     self._log_and_save_update(
@@ -630,7 +663,7 @@ class ShopeeService:
             raise e_cancel
         except Exception as e_batch:
             db.session.rollback()
-            print(f"❌ Erro crítico no sync_batch_from_shopee: {e_batch}")
+            print(f"[ERRO] Erro critico no sync_batch_from_shopee: {e_batch}")
             return {"sucessos": 0, "erros": len(item_id_list)}
 
     def get_sync_progress(self):
@@ -701,7 +734,7 @@ class ShopeeService:
 
                 if code != 200:
                     print(
-                        f"⚠️ Erro ao buscar IDs (Status {status}, Offset {offset}): {code} - Resposta: {resp_json}"
+                        f"[AVISO] Erro ao buscar IDs (Status {status}, Offset {offset}): {code} - Resposta: {resp_json}"
                     )
                     break
 
@@ -804,17 +837,49 @@ class ShopeeService:
 
     def sync_item_from_shopee(self, item_id):
         """
-        Sincroniza um único item.
-        Refatorado para utilizar a lógica de lote para evitar código duplicado.
+        Sincroniza um único item. Suporta Shopee Item ID numérico,
+        ID virtual temporário (TINY_...) ou SKU do produto.
         """
         try:
             creds, erro = self.tokens.ensure_valid_token(1)
             if erro:
                 return {"status": "erro", "mensagem": erro}
 
-            res = self.sync_batch_from_shopee([item_id], creds)
+            item_id_or_sku = str(item_id).strip()
+            is_virtual = item_id_or_sku.startswith("TINY_")
+            is_numeric = item_id_or_sku.isdigit()
+
+            sku_alvo = None
+            if is_virtual:
+                from model.shopeeModel import Anuncios
+                anuncio_local = Anuncios.query.filter_by(shopee_item_id=item_id_or_sku).first()
+                if anuncio_local and anuncio_local.sku_pai:
+                    sku_alvo = anuncio_local.sku_pai
+                else:
+                    return {"status": "erro", "mensagem": f"ID virtual {item_id_or_sku} não localizado ou sem SKU associado."}
+            elif not is_numeric:
+                sku_alvo = item_id_or_sku
+            else:
+                # Se for numérico, verifica se já existe localmente como anúncio.
+                # Se não existir, pode ser um SKU puramente numérico.
+                from model.shopeeModel import Anuncios
+                anuncio_local = Anuncios.query.filter_by(shopee_item_id=item_id_or_sku).first()
+                if not anuncio_local:
+                    sku_alvo = item_id_or_sku
+
+            real_item_ids = []
+            if sku_alvo:
+                print(f"[Sync Item] Identificado como SKU/ID Virtual. Buscando item correspondente na Shopee pelo SKU: {sku_alvo}")
+                matches = self.buscar_todos_ids_sku(sku_alvo, creds)
+                if not matches:
+                    return {"status": "erro", "mensagem": f"Nenhum anúncio encontrado na Shopee com o SKU {sku_alvo}."}
+                real_item_ids = list(set([str(m["item_id"]) for m in matches]))
+            else:
+                real_item_ids = [item_id_or_sku]
+
+            res = self.sync_batch_from_shopee(real_item_ids, creds)
             if res.get("sucessos", 0) > 0:
-                return {"status": "sucesso"}
+                return {"status": "sucesso", "item_ids": real_item_ids}
             return {"status": "erro", "mensagem": "Falha na sincronização do item."}
         except Exception as e:
             return {"status": "erro", "mensagem": str(e)}
@@ -1569,7 +1634,7 @@ class ShopeeService:
             anuncio.updated_at = agora
             db.session.commit()
         except Exception as e:
-            print(f"⚠️ Error in _registrar_no_banco: {e}")
+            print(f"[AVISO] Error in _registrar_no_banco: {e}")
             db.session.rollback()
 
     # --- LÓGICA DE BUSCA ROBUSTA (v3) ---
@@ -2011,7 +2076,7 @@ class ShopeeService:
             return {"discount_list": all_discounts, "more": False, "source": "api"}
 
         except Exception as e:
-            print(f"🔄 Fallback get_shopee_discounts: {str(e)}")
+            print(f"[SYNC] Fallback get_shopee_discounts: {str(e)}")
             try:
                 query = Promocoes.query
                 if status and status != "all":
@@ -2276,7 +2341,7 @@ class ShopeeService:
                 # Se não conseguiu baixar nada (erro de API), registra o log mas permite continuar para mostrar o que tem no banco
                 if not has_fetched_any:
                     print(
-                        f"⚠️ Sincronização falhou para campanha {discount_id}, exibindo dados locais."
+                        f"[AVISO] Sincronizacao falhou para campanha {discount_id}, exibindo dados locais."
                     )
 
                 # Limpeza: itens que estavam nesta campanha localmente mas NÃO vieram na api da Shopee
@@ -2314,14 +2379,14 @@ class ShopeeService:
                 # Retry simples em caso de Deadlock (Psycopg2)
                 if "deadlock" in str(e).lower():
                     print(
-                        f"🔄 Deadlock detectado na campanha {discount_id}. Tentando novamente em 1s..."
+                        f"[SYNC] Deadlock detectado na campanha {discount_id}. Tentando novamente em 1s..."
                     )
                     time.sleep(1)
                     return self.get_discount_item_list(
                         creds, discount_id, page, page_size, search
                     )
 
-                print(f"⚠️ Erro na sincronização passiva de campanha {discount_id}: {e}")
+                print(f"[AVISO] Erro na sincronizacao passiva de campanha {discount_id}: {e}")
                 traceback.print_exc()
 
         # 2. Busca no Banco Local (Após sincronização ou para páginas subsequentes)
@@ -2816,6 +2881,17 @@ class ShopeeService:
         return count
 
 
+def _save_sync_log(total_sincronizados, erro=None):
+    try:
+        from model.shopeeModel import db, SyncLog
+        log = SyncLog(total_sincronizados=total_sincronizados, erro=erro)
+        db.session.add(log)
+        db.session.commit()
+        print(f"[SyncLog] Log salvo com sucesso: {total_sincronizados} itens, erro: {erro}")
+    except Exception as ex:
+        print(f"[SyncLog] Erro ao salvar log no banco: {ex}")
+
+
 def run_full_sync_job():
     """Job do RQ para sincronizar todos os anúncios vinculados.
 
@@ -2837,6 +2913,7 @@ def run_full_sync_job():
             service._update_sync_status(
                 is_running=False, mensagem=f"Erro de Token: {erro}"
             )
+            _save_sync_log(total_sincronizados=0, erro=f"Erro de Token: {erro}")
             return
 
         # 2. Resetar e buscar todos os IDs de itens DIRETAMENTE DA SHOPEE (Full Sync)
@@ -2856,6 +2933,7 @@ def run_full_sync_job():
             service._update_sync_status(
                 is_running=False, mensagem="Nenhum anúncio encontrado na Shopee."
             )
+            _save_sync_log(total_sincronizados=0, erro="Nenhum anúncio encontrado na Shopee.")
             return
 
         # 3. Executa a lógica de sincronização em lotes
@@ -2869,11 +2947,20 @@ def run_full_sync_job():
         print("--- [RQ JOB] Revalidando travas de atualização ---")
         service.revalidate_all_locks()
 
+        # Salvar log de sucesso
+        progress = service.get_sync_progress()
+        err_msg = None
+        if progress.get("erros", 0) > 0:
+            err_msg = f"{progress.get('erros')} erro(s) durante a sincronização."
+        _save_sync_log(total_sincronizados=progress.get("sucessos", 0), erro=err_msg)
+
     except SyncCancelledException as e:
         print(f"--- [RQ INFO] Sincronização cancelada pelo usuário: {str(e)} ---")
         service._update_sync_status(
             is_running=False, mensagem="Cancelado pelo usuário."
         )
+        progress = service.get_sync_progress()
+        _save_sync_log(total_sincronizados=progress.get("sucessos", 0), erro="Cancelado pelo usuário.")
     except Exception as e:
         import traceback
 
@@ -2882,6 +2969,8 @@ def run_full_sync_job():
         service._update_sync_status(
             is_running=False, mensagem=f"Erro Crítico: {str(e)}"
         )
+        progress = service.get_sync_progress()
+        _save_sync_log(total_sincronizados=progress.get("sucessos", 0), erro=f"Erro Crítico: {str(e)}")
 
 
 def run_unlock_check_job():

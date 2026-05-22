@@ -1,7 +1,7 @@
 from model.shopeeModel import db, Anuncios, Produtos, BoostLog, Configuracoes, get_br_now
 from utils.shopee_client import ShopeeClient
 from datetime import datetime, timedelta
-from sqlalchemy import or_  # pyrefly: ignore [missing-import]
+from sqlalchemy import or_, text  # pyrefly: ignore [missing-import]
 import logging
 import random
 
@@ -109,7 +109,6 @@ class BoostController:
             lock = None
 
         # Adquire lock de banco adicional para garantir mutual exclusion absoluta
-        from sqlalchemy import text
         if db.engine.dialect.name == "postgresql":
             try:
                 result = db.session.execute(text("SELECT pg_try_advisory_lock(888888)"))
@@ -327,7 +326,6 @@ class BoostController:
         finally:
             if db_locked and db.engine.dialect.name == "postgresql":
                 try:
-                    from sqlalchemy import text
                     db.session.execute(text("SELECT pg_advisory_unlock(888888)"))
                     db.session.commit()
                 except Exception as dberr:

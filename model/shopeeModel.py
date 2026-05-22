@@ -280,3 +280,22 @@ class BoostLog(db.Model):
             "mensagem": self.mensagem,
             "criado_em": self.criado_em.isoformat() if self.criado_em else None
         }
+
+
+class SyncLog(db.Model):
+    """
+    Tabela de logs de sincronização de anúncios.
+    """
+    __tablename__ = "sync_logs"
+    id = db.Column(db.Integer, primary_key=True)
+    total_sincronizados = db.Column(db.Integer, nullable=False, default=0)
+    erro = db.Column(db.Text, nullable=True)
+    criado_em = db.Column(db.DateTime, default=get_br_now)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "total_sincronizados": self.total_sincronizados,
+            "erro": self.erro,
+            "criado_em": self.criado_em.isoformat() if self.criado_em else None
+        }
