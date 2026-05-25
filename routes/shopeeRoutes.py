@@ -1,5 +1,5 @@
 from flask import Blueprint, request, jsonify, redirect, g  # pyrefly: ignore [missing-import]
-from sqlalchemy import or_  # pyrefly: ignore [missing-import]
+from sqlalchemy import or_, and_  # pyrefly: ignore [missing-import]
 from datetime import datetime, timedelta
 import pandas as pd
 import io
@@ -500,11 +500,16 @@ def get_boost_announcements():
 
     # Sempre inclui anúncios mesmo que estejam com boost ativo (boost_end_at != None)
     if search:
-        query = query.filter(
-            Anuncios.nome.ilike(f"%{search}%")
-            | Anuncios.shopee_item_id.ilike(f"%{search}%")
-            | Anuncios.sku_pai.ilike(f"%{search}%")
-        )
+        search_terms = [term.strip() for term in search.split() if term.strip()]
+        if search_terms:
+            def match_all_terms(column):
+                return and_(*[column.ilike(f"%{term}%") for term in search_terms])
+            
+            query = query.filter(
+                match_all_terms(Anuncios.nome)
+                | match_all_terms(Anuncios.shopee_item_id)
+                | match_all_terms(Anuncios.sku_pai)
+            )
 
     # Ordenar por prioridade e depois por nome
     pagination = query.order_by(
@@ -920,21 +925,26 @@ def get_announcements():
         filters = []
 
         if search:
-            search_filters = [
-                Anuncios.nome.ilike(search_str),
-                Anuncios.sku_pai.ilike(search_str),
-                Anuncios.shopee_item_id.ilike(search_str)
-            ]
-            
-            # Adiciona filtros de variação se o join existir
-            if needs_products_join:
-                search_filters.extend([
-                    Produtos.sku.ilike(search_str),
-                    Produtos.ean.ilike(search_str),
-                    Produtos.nome_variacao.ilike(search_str)
-                ])
+            search_terms = [term.strip() for term in search.split() if term.strip()]
+            if search_terms:
+                def match_all_terms(column):
+                    return and_(*[column.ilike(f"%{term}%") for term in search_terms])
+                    
+                search_filters = [
+                    match_all_terms(Anuncios.nome),
+                    match_all_terms(Anuncios.sku_pai),
+                    match_all_terms(Anuncios.shopee_item_id)
+                ]
                 
-            filters.append(or_(*search_filters))
+                # Adiciona filtros de variação se o join existir
+                if needs_products_join:
+                    search_filters.extend([
+                        match_all_terms(Produtos.sku),
+                        match_all_terms(Produtos.ean),
+                        match_all_terms(Produtos.nome_variacao)
+                    ])
+                    
+                filters.append(or_(*search_filters))
 
         if filter_type == "locked":
             from datetime import datetime, timedelta
@@ -1312,11 +1322,16 @@ def get_shopee_history():
 
         # Filtro de busca (nome, ID ou SKU)
         if search:
-            query = query.filter(
-                HistoricoPreco.nome_produto.ilike(f"%{search}%")
-                | HistoricoPreco.shopee_item_id.ilike(f"%{search}%")
-                | HistoricoPreco.sku.ilike(f"%{search}%")
-            )
+            search_terms = [term.strip() for term in search.split() if term.strip()]
+            if search_terms:
+                def match_all_terms(column):
+                    return and_(*[column.ilike(f"%{term}%") for term in search_terms])
+
+                query = query.filter(
+                    match_all_terms(HistoricoPreco.nome_produto)
+                    | match_all_terms(HistoricoPreco.shopee_item_id)
+                    | match_all_terms(HistoricoPreco.sku)
+                )
 
         # Filtro de status
         if status_filter != "all":
@@ -1494,7 +1509,12 @@ def search_discounts_by_product():
         from model.shopeeModel import Promocoes
         from sqlalchemy import distinct  # pyrefly: ignore [missing-import]
 
-        search_str = f"%{search}%"
+        search_terms = [term.strip() for term in search.split() if term.strip()]
+        if not search_terms:
+            return jsonify({"discount_list": [], "matched_products": {}}), 200
+
+        def match_all_terms(column):
+            return and_(*[column.ilike(f"%{term}%") for term in search_terms])
 
         # 1. Buscar produtos que casam com a busca
         matched_query = (
@@ -1513,12 +1533,12 @@ def search_discounts_by_product():
                 Produtos.promotion_id != None,
                 Produtos.promotion_id != "",
                 (
-                    Anuncios.nome.ilike(search_str)
-                    | Anuncios.shopee_item_id.ilike(search_str)
-                    | Anuncios.sku_pai.ilike(search_str)
-                    | Produtos.sku.ilike(search_str)
-                    | Produtos.shopee_item_id.ilike(search_str)
-                    | Produtos.nome_variacao.ilike(search_str)
+                    match_all_terms(Anuncios.nome)
+                    | match_all_terms(Anuncios.shopee_item_id)
+                    | match_all_terms(Anuncios.sku_pai)
+                    | match_all_terms(Produtos.sku)
+                    | match_all_terms(Produtos.shopee_item_id)
+                    | match_all_terms(Produtos.nome_variacao)
                 ),
             )
         ).all()

@@ -445,7 +445,7 @@ class ShopeeService:
                             ).first()
                         
                         if anuncio:
-                            logger.info(f"[Sync] Convertendo anúncio virtual {anuncio.shopee_item_id} para ID Shopee real {iid}")
+                            print(f"[Sync] Convertendo anúncio virtual {anuncio.shopee_item_id} para ID Shopee real {iid}")
                             for p_var in anuncio.variacoes:
                                 p_var.shopee_item_id = iid
                             anuncio.shopee_item_id = iid
@@ -931,6 +931,7 @@ class ShopeeService:
             float(preco_desejado),
             creds,
             force=force,
+            usuario_id=user_id,
         )
         return resultado, 200
 
@@ -1113,6 +1114,7 @@ class ShopeeService:
         force_promotion=False,
         origem=None,
         force=False,
+        usuario_id=None,
     ):
         """
         Lógica principal de atualização na Shopee.
@@ -1347,6 +1349,7 @@ class ShopeeService:
                         sku=(alvo.get("model_sku") or item_info.get("item_sku")),
                         promo_info=promocao,
                         origem=origem,
+                        usuario_id=usuario_id,
                     )
 
                     detalhes_sucesso.append(
@@ -1360,6 +1363,25 @@ class ShopeeService:
                 else:
                     erro_msg = self._extrair_erro(resp)
                     erros.append({"model_id": mid_atual, "erro": erro_msg})
+
+                    p_atual_erro = 0.0
+                    try:
+                        p_atual_erro = alvo["price_info"][0]["current_price"]
+                    except:
+                        pass
+
+                    self._log_and_save_update(
+                        item_id,
+                        mid_atual,
+                        item_name,
+                        p_atual_erro,
+                        preco_novo,
+                        "erro",
+                        erro_msg,
+                        sku=(alvo.get("model_sku") or item_info.get("item_sku")),
+                        origem=origem,
+                        usuario_id=usuario_id,
+                    )
 
             if sucessos == 0 and alvos:
                 return {
@@ -1504,6 +1526,7 @@ class ShopeeService:
                 force_promotion=force_promotion,
                 origem=origem,
                 force=force,
+                usuario_id=user_id,
             )
 
             resultados.append({"sku": p_req.get("sku"), **res})
