@@ -1115,12 +1115,8 @@ class ShopeeService:
         origem=None,
         force=False,
         usuario_id=None,
+        lista_precos=None,
     ):
-        """
-        Lógica principal de atualização na Shopee.
-        Suporta: Produtos simples, variações, combos, kits.
-        Detecta promoções automaticamente.
-        """
         LOG_DIR = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "..", "..", "logs"
         )
@@ -1129,10 +1125,16 @@ class ShopeeService:
 
         try:
             # Validação de entrada
-            if not item_id or preco_novo <= 0:
+            if not item_id:
                 return {
                     "status": "erro",
-                    "mensagem": f"item_id={item_id}, preco_novo={preco_novo} - Valores inválidos",
+                    "mensagem": f"item_id={item_id} - Valor inválido",
+                }
+            
+            if not lista_precos and preco_novo <= 0:
+                return {
+                    "status": "erro",
+                    "mensagem": f"preco_novo={preco_novo} - Valor inválido",
                 }
 
             # --- PASSO 1: Buscar info do item na Shopee ---
@@ -1147,235 +1149,267 @@ class ShopeeService:
             has_model = item_info.get("has_model", False)
             item_name = item_info.get("item_name", f"Item {item_id}")
 
-            # --- PASSO 2: Obter preço atual ---
-            preco_atual = 0.0
-            try:
-                price_info = item_info.get("price_info") or []
-                if price_info:
-                    preco_atual = price_info[0].get("current_price", 0.0)
-            except Exception as e:
-                pass
-
-            # Se o item tem modelos e o model_id > 0, buscar preço do modelo específico
-            if has_model and model_id > 0:
-                models = self._get_models(item_id, creds)
-                modelo_encontrado = False
-                for m in models:
-                    if int(m.get("model_id", 0)) == model_id:
-                        try:
-                            preco_atual = m["price_info"][0]["current_price"]
-                            modelo_encontrado = True
-                            break
-                        except (KeyError, IndexError) as e:
-                            pass
-
-                if not modelo_encontrado:
-                    return {
-                        "status": "erro",
-                        "mensagem": f"Modelo {model_id} não encontrado no item {item_id}",
-                    }
-            else:
-                # Mesmo que não tenha modelos (simples), se o usuário passou um model_id,
-                # vamos permitir e tratar no payload conforme o status 'has_model' da Shopee.
-                pass
-
-            # --- PASSO 3: Identificar alvos e atualizar ---
-            alvos = []
-            if has_model:
-                models = self._get_models(item_id, creds)
-                if model_id > 0:
-                    # Alvo é um modelo específico
-                    m_alvo = next(
-                        (m for m in models if int(m.get("model_id", 0)) == model_id),
-                        None,
-                    )
-                    if m_alvo:
-                        alvos.append(m_alvo)
-                    else:
-                        return {
-                            "status": "erro",
-                            "mensagem": f"Modelo {model_id} não encontrado",
-                        }
-                else:
-                    # Alvo são TODOS os modelos (Alterar Tudo)
-                    alvos = models
-            else:
-                # Alvo é o produto simples (sem modelos)
-                alvos = [
-                    {
-                        "model_id": 0,
-                        "model_name": item_name,
-                        "price_info": item_info.get("price_info", []),
-                    }
-                ]
-
             sucessos = 0
             erros = []
             detalhes_sucesso = []
 
-            for alvo in alvos:
-                mid_atual = int(alvo.get("model_id") or 0)
-
-                # Buscar promoção para este alvo específico
-                promocao = self._get_active_promotion(
-                    item_id, mid_atual if mid_atual > 0 else None, creds
-                )
-
-                if promocao:
-                    promo_id = promocao.get("promotion_id") or promocao.get(
-                        "discount_id"
-                    )
-                    resp, code = self._update_promotion_price(
-                        promo_id,
-                        item_id,
-                        preco_novo,
-                        mid_atual if mid_atual > 0 else None,
-                        creds,
-                        has_model=has_model,
-                    )
-                elif force_promotion:
-                    # Tentar encontrar uma promoção ativa para vincular
-                    ongoing_promo_id = self._find_any_ongoing_discount(creds)
-                    if ongoing_promo_id:
-                        # Criar payload para adicionar o item
-                        item_to_add = {
-                            "item_id": int(item_id),
-                        }
-                        if has_model and mid_atual > 0:
-                            item_to_add["model_list"] = [
-                                {
-                                    "model_id": int(mid_atual),
-                                    "model_promotion_price": float(preco_novo),
-                                }
-                            ]
-                        else:
-                            item_to_add["item_promotion_price"] = float(preco_novo)
-
-                        resp, code = self.add_discount_item(
-                            creds,
-                            ongoing_promo_id,
-                            [item_to_add],
-                            log_msg="Anuncio colocado em promoção",
-                            origem=origem,
-                        )
-
-                        # Se deu certo, precisamos marcar que é uma promoção para o logger
-                        if code == 200 and not resp.get("error"):
-                            promocao = {
-                                "promotion_id": ongoing_promo_id,
-                                "promotion_type": "Discount Promotions",
-                            }
+            # --- PASSO 2 e 3: Construir alvos_com_preco ---
+            alvos_com_preco = []
+            
+            if lista_precos:
+                models = self._get_models(item_id, creds) if has_model else []
+                for p_req in lista_precos:
+                    req_mid = int(p_req.get("model_id") or 0)
+                    req_preco = round(float(p_req.get("preco") or 0), 2)
+                    
+                    alvo_encontrado = None
+                    if has_model:
+                        alvo_encontrado = next((m for m in models if int(m.get("model_id", 0)) == req_mid), None)
                     else:
-                        return {
-                            "status": "erro",
-                            "mensagem": "Nenhuma promoção ativa (Ongoing) encontrada na loja para vincular o item.",
-                        }
-                elif force_promotion:
-                    # Se for forçar promoção mas o item NÃO está nela, checar limite de 1000
-                    ongoing_promo_id = self._find_any_ongoing_discount(creds)
-                    if ongoing_promo_id:
-                        count_promo = (
-                            db.session.query(Produtos.shopee_item_id)
-                            .filter_by(promotion_id=str(ongoing_promo_id))
-                            .distinct()
-                            .count()
-                        )
-                        if count_promo >= 995:
-                            return {
-                                "status": "erro",
-                                "mensagem": f"A campanha automática atingiu o limite de anúncios ({count_promo}/1000). Remova itens ou crie uma nova na Shopee.",
-                            }
+                        alvo_encontrado = {"model_id": 0, "model_name": item_name, "price_info": item_info.get("price_info", [])}
+                    
+                    if alvo_encontrado:
+                        alvos_com_preco.append({"alvo": alvo_encontrado, "mid": req_mid, "preco": req_preco})
+                    else:
+                        erros.append({"model_id": req_mid, "erro": f"Modelo {req_mid} não encontrado"})
+            else:
+                preco_novo = round(float(preco_novo), 2)
+                alvos = []
+                if has_model:
+                    models = self._get_models(item_id, creds)
+                    if model_id > 0:
+                        m_alvo = next((m for m in models if int(m.get("model_id", 0)) == model_id), None)
+                        if m_alvo: 
+                            alvos.append(m_alvo)
+                        else: 
+                            return {"status": "erro", "mensagem": f"Modelo {model_id} não encontrado"}
+                    else:
+                        alvos = models
                 else:
-                    # --- NOVO: Validação de Segurança (Preço Base) ---
-                    try:
-                        dias_espera = int(self._get_wait_time_config() or 0)
-                    except:
-                        dias_espera = 15
+                    alvos = [{"model_id": 0, "model_name": item_name, "price_info": item_info.get("price_info", [])}]
+                    
+                for alvo in alvos:
+                    mid_atual = int(alvo.get("model_id") or 0)
+                    alvos_com_preco.append({"alvo": alvo, "mid": mid_atual, "preco": preco_novo})
 
-                    is_locked, _, lock_msg = self.validate_price_lock(
-                        item_id, mid_atual
-                    )
+            if not alvos_com_preco:
+                return {
+                    "status": "erro",
+                    "mensagem": f"Nenhum modelo válido para atualizar.",
+                    "detalhes": erros,
+                }
 
+            # --- PASSO 4: Agrupar por tipo de atualização (Batching) ---
+            promo_updates = {} # discount_id -> list of items
+            base_updates = []
+            force_promo_updates = []
+            
+            try:
+                dias_espera = int(self._get_wait_time_config() or 0)
+            except:
+                dias_espera = 15
+
+            for item in alvos_com_preco:
+                mid_atual = item["mid"]
+                promocao = self._get_active_promotion(item_id, mid_atual if mid_atual > 0 else None, creds)
+                item["promocao"] = promocao
+                
+                if promocao:
+                    promo_id = promocao.get("promotion_id") or promocao.get("discount_id")
+                    if promo_id not in promo_updates:
+                        promo_updates[promo_id] = []
+                    promo_updates[promo_id].append(item)
+                elif force_promotion:
+                    force_promo_updates.append(item)
+                else:
+                    is_locked, _, lock_msg = self.validate_price_lock(item_id, mid_atual)
                     if is_locked and dias_espera > 0 and not force:
+                        item["is_locked"] = True
+                        item["lock_msg"] = lock_msg
+                        
+                        item_name_log = item["alvo"].get("model_name") or item_name
                         self._criar_notificacao(
                             tipo="bloqueio",
                             titulo=f"Bloqueio de {dias_espera} Dias",
-                            mensagem=f"{item_name} está Bloqueado Temporariamente por Segurança. Aguarde {dias_espera} dias para nova alteração.",
+                            mensagem=f"{item_name_log} está Bloqueado Temporariamente por Segurança. Aguarde {dias_espera} dias para nova alteração.",
                             item_id=str(item_id),
                             model_id=str(mid_atual),
                         )
-                        return {"status": "erro", "mensagem": lock_msg}
+                    else:
+                        item["is_locked"] = False
+                        base_updates.append(item)
 
-                    resp, code = self._update_base_price(
-                        item_id,
-                        preco_novo,
-                        mid_atual if mid_atual > 0 else None,
-                        creds,
-                        has_model=has_model,
-                    )
-
-                self._salvar_log(
-                    log_path, "AUTO", item_id, mid_atual, preco_novo, resp, code
-                )
-
-                # Na API v2, a Shopee pode retornar 200 com um campo "error" no JSON
+            # --- PASSO 5: Executar atualizações em lote ---
+            
+            # 5.1 Atualizações de Preço Base
+            if base_updates:
+                price_list = []
+                for item in base_updates:
+                    p_item = {"original_price": float(item["preco"])}
+                    if has_model and item["mid"] > 0:
+                        p_item["model_id"] = int(item["mid"])
+                    price_list.append(p_item)
+                    
+                resp, code = self.atualizar_preco_base_lote(item_id, price_list, creds)
+                self._salvar_log(log_path, "AUTO_BATCH_BASE", item_id, 0, 0, resp, code)
+                
                 if code == 200 and not resp.get("error"):
-                    sucessos += 1
-                    # Registrar no banco local individualmente para manter histórico preciso
-                    p_atual = 0.0
-                    try:
-                        p_atual = alvo["price_info"][0]["current_price"]
-                    except:
-                        pass
+                    for item in base_updates:
+                        item["sucesso"] = True
+                        item["resp"] = resp
+                else:
+                    erro_msg = self._extrair_erro(resp)
+                    for item in base_updates:
+                        item["sucesso"] = False
+                        item["erro_msg"] = erro_msg
+                        item["resp"] = resp
 
-                    # Definir mensagem de log personalizada se for promoção
+            # 5.2 Atualizações de Promoção (por discount_id)
+            for discount_id, items in promo_updates.items():
+                item_list = []
+                item_data = {"item_id": int(item_id)}
+                
+                if has_model:
+                    model_list = []
+                    for item in items:
+                        if item["mid"] > 0:
+                            model_list.append({
+                                "model_id": int(item["mid"]),
+                                "model_promotion_price": float(item["preco"])
+                            })
+                    if model_list:
+                        item_data["model_list"] = model_list
+                    else:
+                        item_data["item_promotion_price"] = float(items[0]["preco"])
+                else:
+                    item_data["item_promotion_price"] = float(items[0]["preco"])
+                    
+                item_list.append(item_data)
+                resp, code = self.atualizar_promocao_lote(discount_id, item_list, creds)
+                self._salvar_log(log_path, "AUTO_BATCH_PROMO", item_id, 0, 0, resp, code)
+                
+                if code == 200 and not resp.get("error"):
+                    for item in items:
+                        item["sucesso"] = True
+                        item["resp"] = resp
+                else:
+                    erro_msg = self._extrair_erro(resp)
+                    for item in items:
+                        item["sucesso"] = False
+                        item["erro_msg"] = erro_msg
+                        item["resp"] = resp
+
+            # 5.3 Force Promotion
+            if force_promo_updates:
+                ongoing_promo_id = self._find_any_ongoing_discount(creds)
+                if ongoing_promo_id:
+                    # Checar limite (1000)
+                    from model.shopeeModel import Produtos, db
+                    count_promo = (
+                        db.session.query(Produtos.shopee_item_id)
+                        .filter_by(promotion_id=str(ongoing_promo_id))
+                        .distinct()
+                        .count()
+                    )
+                    if count_promo >= 995:
+                        for item in force_promo_updates:
+                            item["sucesso"] = False
+                            item["erro_msg"] = f"A campanha automática atingiu o limite de anúncios ({count_promo}/1000). Remova itens ou crie uma nova na Shopee."
+                            item["resp"] = {}
+                    else:
+                        item_data = {"item_id": int(item_id)}
+                        if has_model:
+                            model_list = []
+                            for item in force_promo_updates:
+                                if item["mid"] > 0:
+                                    model_list.append({
+                                        "model_id": int(item["mid"]),
+                                        "model_promotion_price": float(item["preco"])
+                                    })
+                            if model_list:
+                                item_data["model_list"] = model_list
+                            else:
+                                item_data["item_promotion_price"] = float(force_promo_updates[0]["preco"])
+                        else:
+                            item_data["item_promotion_price"] = float(force_promo_updates[0]["preco"])
+                            
+                        resp, code = self.add_discount_item(creds, ongoing_promo_id, [item_data], log_msg="Anuncio colocado em promoção", origem=origem)
+                        self._salvar_log(log_path, "AUTO_FORCE_PROMO", item_id, 0, 0, resp, code)
+                        
+                        if code == 200 and not resp.get("error"):
+                            for item in force_promo_updates:
+                                item["sucesso"] = True
+                                item["resp"] = resp
+                                item["promocao"] = {"promotion_id": ongoing_promo_id, "promotion_type": "Discount Promotions"}
+                        else:
+                            erro_msg = self._extrair_erro(resp)
+                            for item in force_promo_updates:
+                                item["sucesso"] = False
+                                item["erro_msg"] = erro_msg
+                                item["resp"] = resp
+                else:
+                    for item in force_promo_updates:
+                        item["sucesso"] = False
+                        item["erro_msg"] = "Nenhuma promoção ativa (Ongoing) encontrada na loja para vincular o item."
+                        item["resp"] = {}
+
+            # --- PASSO 6: Salvar logs e atualizar BD local ---
+            for item in alvos_com_preco:
+                mid_atual = item["mid"]
+                alvo = item["alvo"]
+                
+                p_atual = 0.0
+                try:
+                    p_atual = alvo["price_info"][0]["current_price"]
+                except:
+                    pass
+                    
+                if item.get("is_locked"):
+                    erros.append({"model_id": mid_atual, "erro": item.get("lock_msg")})
+                    continue
+                    
+                if item.get("sucesso"):
+                    sucessos += 1
+                    
                     log_msg = custom_msg
                     if not log_msg:
                         if force_promotion:
                             log_msg = "Anuncio colocado em promoção"
-                        elif promocao:
+                        elif item.get("promocao"):
                             log_msg = "Preço de Promoção Atualizado"
                         else:
                             log_msg = "Atualizado"
-
+                            
                     self._log_and_save_update(
                         item_id,
                         mid_atual,
                         item_name,
                         p_atual,
-                        preco_novo,
+                        item["preco"],
                         "sucesso",
                         log_msg,
                         sku=(alvo.get("model_sku") or item_info.get("item_sku")),
-                        promo_info=promocao,
+                        promo_info=item.get("promocao"),
                         origem=origem,
                         usuario_id=usuario_id,
                     )
-
-                    detalhes_sucesso.append(
-                        {
-                            "model_id": mid_atual,
-                            "nome": alvo.get("model_name") or item_name,
-                            "preco_anterior": p_atual,
-                            "tipo": "promocional" if promocao else "base",
-                        }
-                    )
+                    
+                    detalhes_sucesso.append({
+                        "model_id": mid_atual,
+                        "nome": alvo.get("model_name") or item_name,
+                        "preco_anterior": p_atual,
+                        "tipo": "promocional" if item.get("promocao") else "base",
+                    })
                 else:
-                    erro_msg = self._extrair_erro(resp)
+                    erro_msg = item.get("erro_msg", "Erro desconhecido")
                     erros.append({"model_id": mid_atual, "erro": erro_msg})
-
-                    p_atual_erro = 0.0
-                    try:
-                        p_atual_erro = alvo["price_info"][0]["current_price"]
-                    except:
-                        pass
-
+                    
                     self._log_and_save_update(
                         item_id,
                         mid_atual,
                         item_name,
-                        p_atual_erro,
-                        preco_novo,
+                        p_atual,
+                        item["preco"],
                         "erro",
                         erro_msg,
                         sku=(alvo.get("model_sku") or item_info.get("item_sku")),
@@ -1383,32 +1417,25 @@ class ShopeeService:
                         usuario_id=usuario_id,
                     )
 
-            if sucessos == 0 and alvos:
+            if sucessos == 0 and alvos_com_preco:
                 return {
                     "status": "erro",
                     "mensagem": f"Falha ao atualizar na Shopee: {erros[0]['erro'] if erros else 'Erro desconhecido'}",
                     "detalhes": erros,
                 }
 
-            tipo_final = (
-                "múltiplos"
-                if len(alvos) > 1
-                else ("promocional" if promocao else "base")
-            )
-            # --- AUTO-CLEANUP DE NOTIFICAÇÕES ---
-            # Se alterou o preço com sucesso, as notificações de desbloqueio desse item não são mais necessárias
             try:
-                from model.shopeeModel import NotificacaoSistema
-
+                from model.shopeeModel import NotificacaoSistema, db
                 NotificacaoSistema.query.filter_by(
                     shopee_item_id=str(item_id), tipo="desbloqueio", lida=False
                 ).update({"lida": True})
                 db.session.commit()
             except Exception as e:
                 print(f"Erro ao limpar notificações automáticas: {e}")
+                from model.shopeeModel import db
                 db.session.rollback()
 
-            mensagem = f"Atualizado com sucesso {sucessos} de {len(alvos)} alvos."
+            mensagem = f"Atualizado com sucesso {sucessos} de {len(alvos_com_preco)} alvos."
 
             return {
                 "status": "sucesso",
@@ -1416,7 +1443,7 @@ class ShopeeService:
                 "detalhes": {
                     "item_id": item_id,
                     "sucessos": sucessos,
-                    "total": len(alvos),
+                    "total": len(alvos_com_preco),
                     "itens_atualizados": detalhes_sucesso,
                     "erros": erros,
                 },
@@ -1424,10 +1451,7 @@ class ShopeeService:
 
         except Exception as e:
             import traceback
-
             tb = traceback.format_exc()
-
-            # Salvar traceback em arquivo
             try:
                 error_log = os.path.join(LOG_DIR, "shopee_error.log")
                 with open(error_log, "a", encoding="utf-8") as f:
@@ -1437,40 +1461,6 @@ class ShopeeService:
 
             return {"status": "erro", "mensagem": f"Erro interno: {str(e)}"}
 
-    def _extrair_erro(self, resp):
-        """Extrai mensagem de erro legível de uma resposta Shopee v2."""
-        if isinstance(resp, dict):
-            # Prioridade para campos de erro da API v2
-            if resp.get("error"):
-                return f"{resp.get('error')}: {resp.get('message') or resp.get('msg') or 'Erro desconhecido'}"
-
-            det = resp.get("detalhes", {})
-            if isinstance(det, dict):
-                return det.get("message") or det.get("msg") or json.dumps(det)
-
-            return resp.get("message") or resp.get("msg") or json.dumps(resp)
-        return str(resp)
-
-    def _salvar_log(self, log_path, tipo, item_id, model_id, preco, resp, code):
-        """Salva log de cada operação em arquivo."""
-        try:
-            with open(log_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "tipo": tipo,
-                        "item_id": item_id,
-                        "model_id": model_id,
-                        "preco": preco,
-                        "response": resp,
-                        "status_code": code,
-                        "time": str(datetime.now()),
-                    },
-                    f,
-                    indent=4,
-                    ensure_ascii=False,
-                )
-        except:
-            pass
 
     def alterar_precos_lote(
         self,
@@ -1487,70 +1477,31 @@ class ShopeeService:
         if erro:
             return {"status": "erro", "mensagem": f"Erro de autenticação: {erro}"}
 
-        from model.shopeeModel import Produtos
-
-        resultados = []
-        for p_req in lista_precos:
-            m_id = int(p_req.get("model_id") or 0)
-            p_novo = float(p_req["preco"])
-
-            # Buscar contexto para o histórico
-            p_antigo = 0.0
-            p_nome = "Produto"
-            try:
-                prod_local = Produtos.query.filter_by(
-                    shopee_item_id=str(item_id), shopee_model_id=str(m_id)
-                ).first()
-                if prod_local:
-                    p_antigo = (
-                        prod_local.preco_promocional
-                        if (
-                            prod_local.preco_promocional
-                            and prod_local.preco_promocional > 0
-                        )
-                        else prod_local.preco_base
-                    )
-                    p_nome = prod_local.nome_variacao or (
-                        prod_local.anuncio.nome if prod_local.anuncio else "Produto"
-                    )
-            except:
-                pass
-
-            # Atualizar na Shopee
-            res = self._atualizar_na_shopee(
-                int(item_id),
-                m_id,
-                p_novo,
-                creds,
-                custom_msg=custom_msg,
-                force_promotion=force_promotion,
-                origem=origem,
-                force=force,
-                usuario_id=user_id,
-            )
-
-            resultados.append({"sku": p_req.get("sku"), **res})
-
-        erros = [r for r in resultados if r.get("status") == "erro"]
-        if erros:
-            return {
-                "status": "erro",
-                "mensagem": f"{len(erros)} erro(s) de {len(resultados)}",
-                "detalhes": resultados,
-            }
-        return {"status": "sucesso", "detalhes": resultados}
+        res = self._atualizar_na_shopee(
+            item_id=int(item_id),
+            model_id=0,
+            preco_novo=0,
+            creds=creds,
+            custom_msg=custom_msg,
+            force_promotion=force_promotion,
+            origem=origem,
+            force=force,
+            usuario_id=user_id,
+            lista_precos=lista_precos
+        )
+        return res
 
     def atualizar_preco_base_lote(self, item_id, price_list, creds):
         """Metodo de baixo nível para chamar a API com múltiplos preços de uma vez."""
         path = "/api/v2/product/update_price"
         payload = {"item_id": int(item_id), "price_list": price_list}
-        return self.request_shopee(path, creds, payload)
+        return self._shopee_request(path, creds, method="POST", json_data=payload)
 
     def atualizar_promocao_lote(self, discount_id, item_list, creds):
         """Metodo de baixo nível para atualizar vários produtos em um desconto."""
         path = "/api/v2/discount/update_discount_item"
         payload = {"discount_id": int(discount_id), "item_list": item_list}
-        return self.request_shopee(path, creds, payload)
+        return self._shopee_request(path, creds, method="POST", json_data=payload)
 
     def _criar_notificacao(
         self, tipo, titulo, mensagem, item_id=None, model_id=None, sku=None

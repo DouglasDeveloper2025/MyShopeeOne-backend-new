@@ -17,6 +17,21 @@ class BoostController:
         resp = self.client.get_boosted_list()
 
         if resp.get("error") and resp.get("error") != "":
+            # Se for erro de timeout, não aborta o ciclo completamente
+            # Apenas loga e retorna a contagem local como fallback
+            if resp.get("error_type") == "timeout":
+                logger.warning(f"Timeout ao buscar lista de boost da Shopee. Usando contagem local como fallback.")
+                self._log_boost(
+                    None, "sync_timeout", "warning", f"Timeout ao buscar lista de boost. Usando dados locais como fallback."
+                )
+                # Retorna contagem local de boost ativos
+                agora = get_br_now()
+                local_active_count = Anuncios.query.filter(
+                    Anuncios.boost_end_at != None,
+                    Anuncios.boost_end_at > agora
+                ).count()
+                return local_active_count
+            
             self._log_boost(
                 None, "sync_error", "error", f"Erro ao buscar lista de boost: {resp}"
             )
@@ -214,6 +229,31 @@ class BoostController:
 
                 if resp.get("error") and resp.get("error") != "":
                     msg = resp.get("message") or resp.get("error")
+                    
+                    # === NOVO: Trata erros de timeout da API ===
+                    # Se a Shopee está com timeout, não faz sentido tentar os próximos candidatos
+                    if resp.get("error_type") == "timeout" or "timed out" in str(msg).lower() or "timeout" in str(msg).lower() or "max retries exceeded" in str(msg).lower():
+                        logger.warning(
+                            f"Timeout ao tentar impulsionar {candidate.nome} ({candidate.shopee_item_id}). "
+                            f"Interrompendo ciclo — Shopee API pode estar instável."
+                        )
+                        self._log_boost(
+                            candidate.shopee_item_id,
+                            "boost_timeout",
+                            "warning",
+                            f"Timeout ao impulsionar '{candidate.nome}'. Ciclo interrompido para evitar falhas em cascata.",
+                            candidate.nome,
+                        )
+                        # Define cooldown curto (3 minutos) para evitar retry imediato
+                        try:
+                            from config.redis_config import redis_conn as _redis
+                            if _redis:
+                                _redis.setex("shopee_boost_slot_limit_cooldown", 180, "1")
+                                logger.info("Definido cooldown de 3 minutos no Redis após timeout da API Shopee.")
+                        except Exception as rex:
+                            logger.warning(f"Erro ao definir cooldown de timeout no Redis: {rex}")
+                        break
+                    
                     self._log_boost(
                         candidate.shopee_item_id,
                         "boost_error",

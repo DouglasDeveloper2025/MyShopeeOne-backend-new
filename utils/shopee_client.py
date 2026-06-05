@@ -1,13 +1,23 @@
 import hmac
 import hashlib
 import time
+import random
 import requests
+from requests.exceptions import ConnectionError, Timeout, ReadTimeout, ConnectTimeout
 import json
 import logging
 from datetime import datetime
 from model.shopeeModel import db, IntegracaoShopee
 
 logger = logging.getLogger(__name__)
+
+# Timeout de conexão (segundos) e timeout de leitura (segundos)
+# Separados para tratar cenários diferentes:
+# - connect_timeout: tempo máximo para estabelecer conexão TCP
+# - read_timeout: tempo máximo para receber a resposta após a conexão ser estabelecida
+DEFAULT_CONNECT_TIMEOUT = 15
+DEFAULT_READ_TIMEOUT = 45
+MAX_RETRIES_TIMEOUT = 3  # Retries extras para erros de timeout
 
 class ShopeeClient:
     def __init__(self, integracao_id=None):
@@ -76,14 +86,17 @@ class ShopeeClient:
         if params:
             common_params.update(params)
 
-        for attempt in range(retries + 1):
+        # Para erros de timeout, usamos mais tentativas que o padrão
+        max_attempts = max(retries + 1, MAX_RETRIES_TIMEOUT + 1)
+
+        for attempt in range(max_attempts):
             try:
                 response = requests.request(
                     method=method,
                     url=url,
                     params=common_params,
                     json=json_data,
-                    timeout=30
+                    timeout=(DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT)
                 )
                 
                 data = response.json()
@@ -116,10 +129,59 @@ class ShopeeClient:
                             continue
                 
                 return data
+
+            except (ConnectTimeout, ConnectionError) as e:
+                # Erros de conexão/timeout de conexão — a Shopee pode estar instável
+                # Usa backoff exponencial com jitter para evitar thundering herd
+                if attempt < MAX_RETRIES_TIMEOUT:
+                    base_delay = min(2 ** (attempt + 1), 30)  # 2s, 4s, 8s, max 30s
+                    jitter = random.uniform(0, base_delay * 0.5)
+                    wait_time = base_delay + jitter
+                    logger.warning(
+                        f"Shopee API ConnectTimeout/ConnectionError (tentativa {attempt + 1}/{MAX_RETRIES_TIMEOUT + 1}): {str(e)}. "
+                        f"Aguardando {wait_time:.1f}s antes de retry..."
+                    )
+                    time.sleep(wait_time)
+                    # Recalcula timestamp e assinatura para o retry (evita assinatura expirada)
+                    new_timestamp = int(time.time())
+                    common_params["timestamp"] = new_timestamp
+                    if use_auth:
+                        common_params["sign"] = self._generate_sign(path, new_timestamp, common_params.get("access_token"), common_params.get("shop_id"))
+                    else:
+                        common_params["sign"] = self._generate_sign(path, new_timestamp)
+                    continue
+                else:
+                    logger.error(f"Shopee API ConnectTimeout/ConnectionError FINAL (após {MAX_RETRIES_TIMEOUT + 1} tentativas): {str(e)}")
+                    return {"error": str(e), "error_type": "timeout"}
+
+            except (ReadTimeout, Timeout) as e:
+                # Timeout de leitura — conexão foi estabelecida mas resposta demorou demais
+                if attempt < MAX_RETRIES_TIMEOUT:
+                    base_delay = min(3 ** (attempt + 1), 45)  # 3s, 9s, 27s, max 45s
+                    jitter = random.uniform(0, base_delay * 0.3)
+                    wait_time = base_delay + jitter
+                    logger.warning(
+                        f"Shopee API ReadTimeout (tentativa {attempt + 1}/{MAX_RETRIES_TIMEOUT + 1}): {str(e)}. "
+                        f"Aguardando {wait_time:.1f}s antes de retry..."
+                    )
+                    time.sleep(wait_time)
+                    # Recalcula timestamp e assinatura
+                    new_timestamp = int(time.time())
+                    common_params["timestamp"] = new_timestamp
+                    if use_auth:
+                        common_params["sign"] = self._generate_sign(path, new_timestamp, common_params.get("access_token"), common_params.get("shop_id"))
+                    else:
+                        common_params["sign"] = self._generate_sign(path, new_timestamp)
+                    continue
+                else:
+                    logger.error(f"Shopee API ReadTimeout FINAL (após {MAX_RETRIES_TIMEOUT + 1} tentativas): {str(e)}")
+                    return {"error": str(e), "error_type": "timeout"}
+
             except Exception as e:
-                if attempt == retries:
+                if attempt >= retries:
                     logger.error(f"Shopee API Final Failure: {str(e)}")
                     return {"error": str(e)}
+                # Backoff linear para erros genéricos
                 time.sleep(1 * (attempt + 1))
         
         return {"error": "Max retries reached"}
