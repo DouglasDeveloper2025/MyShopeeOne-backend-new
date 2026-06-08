@@ -1251,7 +1251,6 @@ class ShopeeService:
                     price_list.append(p_item)
                     
                 resp, code = self.atualizar_preco_base_lote(item_id, price_list, creds)
-                self._salvar_log(log_path, "AUTO_BATCH_BASE", item_id, 0, 0, resp, code)
                 
                 if code == 200 and not resp.get("error"):
                     for item in base_updates:
@@ -1286,7 +1285,6 @@ class ShopeeService:
                     
                 item_list.append(item_data)
                 resp, code = self.atualizar_promocao_lote(discount_id, item_list, creds)
-                self._salvar_log(log_path, "AUTO_BATCH_PROMO", item_id, 0, 0, resp, code)
                 
                 if code == 200 and not resp.get("error"):
                     for item in items:
@@ -1334,7 +1332,6 @@ class ShopeeService:
                             item_data["item_promotion_price"] = float(force_promo_updates[0]["preco"])
                             
                         resp, code = self.add_discount_item(creds, ongoing_promo_id, [item_data], log_msg="Anuncio colocado em promoção", origem=origem)
-                        self._salvar_log(log_path, "AUTO_FORCE_PROMO", item_id, 0, 0, resp, code)
                         
                         if code == 200 and not resp.get("error"):
                             for item in force_promo_updates:
