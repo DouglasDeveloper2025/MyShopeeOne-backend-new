@@ -2594,7 +2594,19 @@ class ShopeeService:
         resp, code = self._shopee_request(path, creds, method="POST", json_data=payload)
 
         if code == 200:
-            # Sincronizar Localmente
+            resp_data = resp.get("response", {})
+            error_list = resp_data.get("error_list", [])
+            
+            if error_list:
+                # Se há erros, vamos formatar a mensagem e falhar o processo para o item.
+                # A API retorna 200 OK mesmo quando os itens falham e vêm na error_list.
+                return {
+                    "status": "erro",
+                    "mensagem": error_list[0].get("fail_message", "Erro ao adicionar item na promoção."),
+                    "shopee_response": resp
+                }, 400
+
+            # Sincronizar Localmente apenas se não houve erro
             for itm in items:
                 iid = str(itm.get("item_id"))
                 models = itm.get("model_list", [])

@@ -54,8 +54,9 @@ app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET_KEY")
 app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
     "pool_pre_ping": True,
     "pool_recycle": 300,
-    "pool_size": 10,
-    "max_overflow": 20,
+    "pool_size": 5,
+    "max_overflow": 5,
+    "pool_timeout": 30,
 }
 
 # Inicializa o DB
