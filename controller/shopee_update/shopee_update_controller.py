@@ -1051,44 +1051,44 @@ class ShopeeService:
                         )
                     else:
                         # Se não for promoção, atualiza o preco_base e limpa promocional
+                        preco_antigo = prod.preco_base or 0.0
                         prod.preco_base = float(p_novo)
                         prod.preco_promocional = None
                         prod.promotion_id = None
-                        prod.preco_modificado_em = (
-                            agora_br  # Atualiza a trava SOMENTE para preço base
-                        )
-                        prod.notificado_desbloqueio = (
-                            False  # Resetar flag de notificação de desbloqueio
-                        )
-                        try:
-                            dias_espera = int(self._get_wait_time_config() or 0)
-                        except:
-                            dias_espera = 15
+                        houve_aumento = round(float(p_novo), 2) > round(float(preco_antigo), 2)
+                        if houve_aumento:
+                            prod.preco_modificado_em = (
+                                agora_br  # Atualiza a trava SOMENTE se houver aumento
+                            )
+                            prod.notificado_desbloqueio = False
 
-                        if dias_espera <= 0:
-                            # Caso não haja trava, já notifica que está pronto para promoção
-                            prod.notificado_desbloqueio = True  # Já notificamos aqui
-                            self._criar_notificacao(
-                                tipo="desbloqueio",
-                                titulo=nome,
-                                mensagem=f"Preço alterado com sucesso! Este anúncio já está disponível para ser colocado em uma Promoção.",
-                                item_id=str(item_id),
-                                model_id=str(model_id),
-                                sku=sku,
-                            )
-                        else:
-                            # Caso contrário, mantém a lógica de bloqueio por segurança
-                            prod.notificado_desbloqueio = (
-                                False  # Resetar para o background checker pegar depois
-                            )
-                            self._criar_notificacao(
-                                tipo="bloqueio",
-                                titulo=nome,
-                                mensagem=f"Esse anuncio está temporariamente bloqueado por Segurança, aguarde {dias_espera} dias para alterar o preço novamente ou Adicionar em uma Promoção.",
-                                item_id=str(item_id),
-                                model_id=str(model_id),
-                                sku=sku,
-                            )
+                            try:
+                                dias_espera = int(self._get_wait_time_config() or 0)
+                            except:
+                                dias_espera = 15
+
+                            if dias_espera <= 0:
+                                # Caso não haja trava, já notifica que está pronto para promoção
+                                prod.notificado_desbloqueio = True  # Já notificamos aqui
+                                self._criar_notificacao(
+                                    tipo="desbloqueio",
+                                    titulo=nome,
+                                    mensagem=f"Preço alterado com sucesso! Este anúncio já está disponível para ser colocado em uma Promoção.",
+                                    item_id=str(item_id),
+                                    model_id=str(model_id),
+                                    sku=sku,
+                                )
+                            else:
+                                # Caso contrário, mantém a lógica de bloqueio por segurança
+                                prod.notificado_desbloqueio = False
+                                self._criar_notificacao(
+                                    tipo="bloqueio",
+                                    titulo=nome,
+                                    mensagem=f"Esse anuncio está temporariamente bloqueado por Segurança, aguarde {dias_espera} dias para alterar o preço novamente ou Adicionar em uma Promoção.",
+                                    item_id=str(item_id),
+                                    model_id=str(model_id),
+                                    sku=sku,
+                                )
 
                     prod.updated_at = agora_br
                     # Atualizar o pai também se existir
@@ -1601,7 +1601,8 @@ class ShopeeService:
                 anuncio.nome = item_info.get("item_name") or anuncio.nome
 
             produto.updated_at = agora
-            produto.preco_modificado_em = agora  # Atualiza a trava de 15 dias
+            if not is_promo and round(float(preco_nv), 2) > round(float(preco_ant), 2):
+                produto.preco_modificado_em = agora  # Atualiza a trava de 15 dias APENAS se houver aumento no preco_base
             anuncio.updated_at = agora
             db.session.commit()
         except Exception as e:
@@ -1880,12 +1881,13 @@ class ShopeeService:
                     if produto.preco_promocional and produto.preco_promocional > 0:
                         produto.preco_promocional = preco_nv
                     else:
+                        preco_antigo = produto.preco_base or 0.0
                         produto.preco_base = preco_nv
+                        if round(float(preco_nv), 2) > round(float(preco_antigo), 2):
+                            produto.preco_modificado_em = self._get_brasilia_time()  # Atualiza a trava de 15 dias APENAS se houver aumento
+
                     produto.sku = sku_raw
                     produto.updated_at = self._get_brasilia_time()
-                    produto.preco_modificado_em = (
-                        produto.updated_at
-                    )  # Atualiza a trava de 15 dias
                     if produto.anuncio:
                         produto.anuncio.updated_at = produto.updated_at
 

@@ -641,7 +641,7 @@ def _format_announcement(a: Anuncios, dias_espera: int = 0):
             "price_promo": p.preco_promocional,
             "promotion_id": p.promotion_id,
             "ean": p.ean,
-            "status": p.situacao,
+            "status": "ESGOTADO" if p.situacao == "NORMAL" and (p.estoque is None or p.estoque <= 0) else p.situacao,
             "dias_faltantes": dias_faltantes,
             "updatedAt": p.updated_at.strftime("%d/%m/%Y %H:%M:%S")
             if p.updated_at
@@ -776,6 +776,10 @@ def _format_announcement(a: Anuncios, dias_espera: int = 0):
             item_data["min_price"] = 0.0
             item_data["max_price"] = 0.0
             item_data["price"] = 0.0
+
+        if item_data.get("status") == "NORMAL" and item_data.get("variacoes"):
+            if all(v.get("status") == "ESGOTADO" for v in item_data["variacoes"]):
+                item_data["status"] = "ESGOTADO"
     else:
         # Tenta pegar do pai se não houver variações explicítas no mapeamento?
         # Na verdade, no nosso schema, produtos simples tem model_id="0"
@@ -895,7 +899,8 @@ def get_announcements():
         page = request.args.get("page", 1, type=int)
         per_page = request.args.get("per_page", 10, type=int)
         search = request.args.get("search", "", type=str)
-        filter_type = request.args.get("filter", "all", type=str)
+        filter_status = request.args.get("status", "all", type=str)
+        filter_promo = request.args.get("promo", "all", type=str)
         sort_field = request.args.get("sort", "updated_at", type=str)
         sort_order = request.args.get("order", "desc", type=str)
 
@@ -913,7 +918,7 @@ def get_announcements():
 
         # 1. Aplicar Joins Necessários (Apenas uma vez)
         # Se houver busca ou filtros que dependam de Produtos, fazemos o join agora
-        needs_products_join = bool(search) or filter_type in ["active", "inactive", "locked"]
+        needs_products_join = bool(search) or filter_status in ["active", "inactive", "locked"]
         
         if needs_products_join:
             # Usamos outerjoin para busca para não excluir anúncios sem variações que batem no nome
@@ -946,30 +951,27 @@ def get_announcements():
                     
                 filters.append(or_(*search_filters))
 
-        if filter_type == "locked":
+        if filter_status == "locked":
             from datetime import datetime, timedelta
             import pytz
             agora_br = datetime.now(pytz.timezone("America/Sao_Paulo")).replace(tzinfo=None)
             limite = agora_br - timedelta(days=dias_espera)
             filters.append(Produtos.preco_modificado_em > limite)
+        elif filter_status == "active":
+            filters.append(and_(Produtos.situacao == "NORMAL", Produtos.estoque > 0))
+        elif filter_status == "inactive":
+            filters.append(or_(Produtos.situacao != "NORMAL", Produtos.estoque == None, Produtos.estoque <= 0))
             
-        elif filter_type == "promo":
+        if filter_promo == "promo":
             subq = db.session.query(Produtos.shopee_item_id).filter(
                 (Produtos.promotion_id != None) & (Produtos.promotion_id != "")
             ).distinct().scalar_subquery()
             filters.append(Anuncios.shopee_item_id.in_(subq))
-            
-        elif filter_type in ["no-promo", "available"]:
+        elif filter_promo in ["no-promo", "available"]:
             subq = db.session.query(Produtos.shopee_item_id).filter(
                 (Produtos.promotion_id != None) & (Produtos.promotion_id != "")
             ).distinct().scalar_subquery()
             filters.append(~Anuncios.shopee_item_id.in_(subq))
-            
-        elif filter_type == "active":
-            filters.append(Produtos.situacao == "NORMAL")
-            
-        elif filter_type == "inactive":
-            filters.append(Produtos.situacao != "NORMAL")
 
         # Aplicar todos os filtros acumulados
         if filters:
@@ -1752,6 +1754,22 @@ def get_discount_items(discount_id):
     except Exception as e:
         return jsonify({"status": "erro", "mensagem": str(e)}), 500
 
+
+@shopee_bp.route("/shopee/discounts/<discount_id>/check-limit", methods=["POST"])
+@token_required
+def check_discount_limit_route(discount_id):
+    """Verifica se a campanha está cheia antes de prosseguir com alterações no frontend."""
+    try:
+        dados = request.get_json()
+        items = dados.get("items", [])
+        items_count = len(items)
+        count_atual = db.session.query(Produtos.shopee_item_id).filter_by(promotion_id=str(discount_id)).distinct().count()
+        if (count_atual + items_count) > 995:
+            msg = f"Campanha no Limite ({count_atual}/1000). Remova itens da promoção para poder adicionar novos."
+            return jsonify({"status": "erro", "mensagem": msg}), 400
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        return jsonify({"status": "erro", "mensagem": str(e)}), 500
 
 @shopee_bp.route("/shopee/discounts/<discount_id>/items", methods=["POST"])
 @token_required
