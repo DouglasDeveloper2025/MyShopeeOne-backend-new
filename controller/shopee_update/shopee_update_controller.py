@@ -1104,6 +1104,23 @@ class ShopeeService:
             )
             print(error_msg)
 
+    def _extrair_erro(self, resp):
+        """Extrai a mensagem de erro de uma resposta da API da Shopee."""
+        if not resp:
+            return "Erro desconhecido da API"
+        if isinstance(resp, dict):
+            if "response" in resp and isinstance(resp["response"], dict):
+                error_list = resp["response"].get("error_list")
+                if error_list and isinstance(error_list, list) and len(error_list) > 0:
+                    fail_msg = error_list[0].get("fail_message")
+                    if fail_msg:
+                        return fail_msg
+            if "message" in resp and resp["message"]:
+                return resp["message"]
+            if "error" in resp and resp["error"]:
+                return resp["error"]
+        return str(resp)
+
     def _atualizar_na_shopee(
         self,
         item_id,
@@ -1237,7 +1254,57 @@ class ShopeeService:
                         )
                     else:
                         item["is_locked"] = False
-                        base_updates.append(item)
+
+                        # --- ESTRATÉGIA AUTOMÁTICA DE PRECIFICAÇÃO ---
+                        
+                        # Verificar se a requisição veio da sincronização de combos do frontend
+                        # Combos têm preço calculado e NÃO devem receber inflação ou promoção automática
+                        is_combo_sync = (origem == "ComboSync")
+
+                        if is_combo_sync:
+                            # Combo/Kit → atualizar preço base normalmente, sem inflação ou promoção
+                            print(f"[PRICING] Item {item_id} model {mid_atual}: Sincronização de Combo detectada. Atualizando preço base diretamente.")
+                            base_updates.append(item)
+                        else:
+                            # Buscar preço base atual do banco local
+                            from model.shopeeModel import Produtos as ProdModel
+                            prod_local = ProdModel.query.filter_by(
+                                shopee_item_id=str(item_id),
+                                shopee_model_id=str(mid_atual)
+                            ).first()
+                            # Fallback: se não achar com model_id, tenta o primeiro do item
+                            if not prod_local and str(mid_atual) == "0":
+                                prod_local = ProdModel.query.filter_by(
+                                    shopee_item_id=str(item_id)
+                                ).first()
+
+                            preco_base_atual = prod_local.preco_base if prod_local else 0.0
+                            preco_solicitado = item["preco"]
+
+                            if preco_base_atual > 0 and abs(preco_solicitado - preco_base_atual) > 0.01:
+                                if preco_solicitado > preco_base_atual:
+                                    # Preço MAIOR → Infla 25% e salva como preço base
+                                    preco_inflado = round(preco_solicitado * 1.25, 2)
+                                    item["preco"] = preco_inflado
+                                    item["preco_original_solicitado"] = preco_solicitado
+                                    print(f"[PRICING] Item {item_id} model {mid_atual}: Preço subiu ({preco_base_atual} -> {preco_solicitado}). Inflando 25%: {preco_inflado}")
+                                    base_updates.append(item)
+                                else:
+                                    if force:
+                                        # Usuário aceitou a trava. A Shopee não permite colocar em promoção um item recém-alterado.
+                                        # A única forma de alterar o preço para baixo nesse caso é alterando o PREÇO BASE diretamente.
+                                        item["preco"] = preco_solicitado
+                                        print(f"[PRICING] Item {item_id} model {mid_atual}: Preço baixou ({preco_base_atual} -> {preco_solicitado}), mas sob TRAVA (force). Atualizando PREÇO BASE.")
+                                        base_updates.append(item)
+                                    else:
+                                        # Preço MENOR → Manter preço base antigo, colocar em promoção automática
+                                        item["preco_promo_desejado"] = preco_solicitado
+                                        item["preco"] = preco_solicitado  # será usado como promo price
+                                        print(f"[PRICING] Item {item_id} model {mid_atual}: Preço baixou ({preco_base_atual} -> {preco_solicitado}). Encaminhando para promoção automática.")
+                                        force_promo_updates.append(item)
+                            else:
+                                # Preço igual ou sem referência → atualizar normalmente
+                                base_updates.append(item)
 
             # --- PASSO 5: Executar atualizações em lote ---
             
@@ -1331,7 +1398,7 @@ class ShopeeService:
                         else:
                             item_data["item_promotion_price"] = float(force_promo_updates[0]["preco"])
                             
-                        resp, code = self.add_discount_item(creds, ongoing_promo_id, [item_data], log_msg="Anuncio colocado em promoção", origem=origem)
+                        resp, code = self.add_discount_item(creds, ongoing_promo_id, [item_data], log_msg="Anuncio colocado em promoção", origem=origem, force=force)
                         
                         if code == 200 and not resp.get("error"):
                             for item in force_promo_updates:
@@ -1432,7 +1499,23 @@ class ShopeeService:
                 from model.shopeeModel import db
                 db.session.rollback()
 
-            mensagem = f"Atualizado com sucesso {sucessos} de {len(alvos_com_preco)} alvos."
+            # Gerar mensagem descritiva baseada nas ações executadas
+            partes_msg = []
+            inflados = [i for i in alvos_com_preco if i.get("preco_original_solicitado")]
+            promovidos = [i for i in alvos_com_preco if i.get("preco_promo_desejado") and i.get("sucesso")]
+            normais = [i for i in base_updates if i.get("sucesso") and not i.get("preco_original_solicitado")]
+
+            if inflados:
+                partes_msg.append(f"{len(inflados)} variação(ões) inflada(s) em 25%")
+            if promovidos:
+                partes_msg.append(f"{len(promovidos)} variação(ões) colocada(s) em promoção automática")
+            if normais:
+                partes_msg.append(f"{len(normais)} preço(s) atualizado(s)")
+            
+            if partes_msg:
+                mensagem = "Sucesso! " + ", ".join(partes_msg) + "."
+            else:
+                mensagem = f"Atualizado com sucesso {sucessos} de {len(alvos_com_preco)} alvos."
 
             return {
                 "status": "sucesso",
@@ -1904,18 +1987,20 @@ class ShopeeService:
 
     # --- Módulo de Promoções (V2 Discount) ---
     def _find_any_ongoing_discount(self, creds):
-        """Busca o ID da primeira promoção ativa (ongoing) na loja."""
-        path = "/api/v2/discount/get_discount_list"
-        params = {
-            "page_no": 1,
-            "page_size": 10,
-            "discount_status": "ongoing",
-        }
-        resp, code = self._shopee_request(path, creds, params=params)
-        if code == 200 and not resp.get("error"):
-            discounts = resp.get("response", {}).get("discount_list", [])
-            if discounts:
-                return discounts[0]["discount_id"]
+        """Busca o ID da promoção ativa (ongoing) mais vazia na loja e sincroniza no banco."""
+        res = self.get_shopee_discounts(creds, status="ongoing", force_sync=True)
+        discounts = res.get("discount_list", [])
+        if discounts:
+            # Selecionar a campanha com menos itens (mais vazia)
+            best = None
+            best_count = float("inf")
+            for d in discounts:
+                did = int(d["discount_id"])
+                count = d.get("item_count", 0)
+                if count < best_count:
+                    best_count = count
+                    best = did
+            return best
         return None
 
     def get_shopee_discounts(
@@ -2372,15 +2457,20 @@ class ShopeeService:
             .filter(Produtos.promotion_id == str(discount_id))
         )
 
-        if search:
-            search_str = f"%{search}%"
+        if search and search.strip():
+            search_terms = [t.strip() for t in search.split() if t.strip()]
+            from sqlalchemy import and_, or_
+            
+            def match_all_terms(column):
+                return and_(*[column.ilike(f"%{term}%") for term in search_terms])
+
             query = query.filter(
                 or_(
-                    Anuncios.nome.ilike(search_str),
-                    Anuncios.sku_pai.ilike(search_str),
-                    Produtos.sku.ilike(search_str),
-                    Produtos.shopee_item_id.ilike(search_str),
-                    Produtos.shopee_model_id.ilike(search_str),
+                    match_all_terms(Anuncios.nome),
+                    match_all_terms(Anuncios.sku_pai),
+                    match_all_terms(Produtos.sku),
+                    match_all_terms(Produtos.shopee_item_id),
+                    match_all_terms(Produtos.shopee_model_id),
                 )
             )
 

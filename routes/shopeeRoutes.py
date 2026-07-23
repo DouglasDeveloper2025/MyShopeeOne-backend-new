@@ -969,9 +969,9 @@ def get_announcements():
             filters.append(Anuncios.shopee_item_id.in_(subq))
         elif filter_promo in ["no-promo", "available"]:
             subq = db.session.query(Produtos.shopee_item_id).filter(
-                (Produtos.promotion_id != None) & (Produtos.promotion_id != "")
+                or_(Produtos.promotion_id == None, Produtos.promotion_id == "")
             ).distinct().scalar_subquery()
-            filters.append(~Anuncios.shopee_item_id.in_(subq))
+            filters.append(Anuncios.shopee_item_id.in_(subq))
 
         # Aplicar todos os filtros acumulados
         if filters:
@@ -1540,6 +1540,7 @@ def search_discounts_by_product():
                     | match_all_terms(Anuncios.sku_pai)
                     | match_all_terms(Produtos.sku)
                     | match_all_terms(Produtos.shopee_item_id)
+                    | match_all_terms(Produtos.shopee_model_id)
                     | match_all_terms(Produtos.nome_variacao)
                 ),
             )
