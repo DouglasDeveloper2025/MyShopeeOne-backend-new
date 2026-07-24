@@ -1506,16 +1506,16 @@ class ShopeeService:
             normais = [i for i in base_updates if i.get("sucesso") and not i.get("preco_original_solicitado")]
 
             if inflados:
-                partes_msg.append(f"{len(inflados)} variação(ões) inflada(s) em 25%")
+                partes_msg.append(f"{len(inflados)} Anúncio teve seu Preço alterado para + 25%")
             if promovidos:
-                partes_msg.append(f"{len(promovidos)} variação(ões) colocada(s) em promoção automática")
+                partes_msg.append(f"{len(promovidos)} Anúncio teve seu Preço alterado para Promoção Automática")
             if normais:
-                partes_msg.append(f"{len(normais)} preço(s) atualizado(s)")
+                partes_msg.append(f"{len(normais)} Anúncio teve seu Preço alterado")
             
             if partes_msg:
                 mensagem = "Sucesso! " + ", ".join(partes_msg) + "."
             else:
-                mensagem = f"Atualizado com sucesso {sucessos} de {len(alvos_com_preco)} alvos."
+                mensagem = f"Atualizado com sucesso {sucessos} de {len(alvos_com_preco)} Anúncio(s)."
 
             return {
                 "status": "sucesso",
