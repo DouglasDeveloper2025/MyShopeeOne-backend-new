@@ -1124,17 +1124,54 @@ class ShopeeService:
         """Extrai a mensagem de erro de uma resposta da API da Shopee."""
         if not resp:
             return "Erro desconhecido da API"
+            
+        def _traduzir(msg, err_code=None):
+            if err_code == "discount.error_item_under_block_categories" or (msg and "prohibited from promotions" in str(msg).lower()):
+                return "Este produto pertence a uma categoria que não pode participar de promoções devido a Normas da Propria Shopee."
+            
+            if msg and "already in this discount" in str(msg).lower():
+                return "Este produto/variação já está ativo nesta promoção."
+            
+            if msg and "discount price is greater than original price" in str(msg).lower():
+                return "O preço promocional informado é maior que o preço base atual do produto na Shopee. Aumentos de preço devem ser feitos no Preço Base."
+            
+            return msg
+
         if isinstance(resp, dict):
             if "response" in resp and isinstance(resp["response"], dict):
                 error_list = resp["response"].get("error_list")
                 if error_list and isinstance(error_list, list) and len(error_list) > 0:
                     fail_msg = error_list[0].get("fail_message")
-                    if fail_msg:
-                        return fail_msg
-            if "message" in resp and resp["message"]:
-                return resp["message"]
-            if "error" in resp and resp["error"]:
-                return resp["error"]
+                    fail_error = error_list[0].get("fail_error")
+                    traduzido = _traduzir(fail_msg, fail_error)
+                    if traduzido:
+                        return traduzido
+                        
+            err_code = resp.get("error")
+            err_msg = resp.get("message") or resp.get("mensagem")
+            
+            # Checar shopee_response aninhado (gerado pelo add_discount_item)
+            shopee_resp = resp.get("shopee_response")
+            if isinstance(shopee_resp, dict) and "response" in shopee_resp:
+                error_list = shopee_resp["response"].get("error_list")
+                if error_list and isinstance(error_list, list) and len(error_list) > 0:
+                    fail_msg = error_list[0].get("fail_message")
+                    fail_error = error_list[0].get("fail_error")
+                    trad = _traduzir(fail_msg, fail_error)
+                    if trad: return trad
+                    
+            # Para fallback caso seja injetado direto no resp
+            if err_code == "discount.add_failed" and err_msg:
+                traduzido = _traduzir(err_msg, err_code)
+                if traduzido: return traduzido
+                
+            traduzido = _traduzir(err_msg, err_code)
+            if traduzido:
+                return traduzido
+                
+            if err_code:
+                return err_code
+                
         return str(resp)
 
     def _atualizar_na_shopee(
@@ -1294,7 +1331,7 @@ class ShopeeService:
                         preco_base_atual = prod_local.preco_base if prod_local else 0.0
                         preco_solicitado = item["preco"]
 
-                        if preco_base_atual > 0 and abs(preco_solicitado - preco_base_atual) >= 0.01:
+                        if preco_base_atual > 0 and round(abs(preco_solicitado - preco_base_atual), 2) >= 0.01:
                             if preco_solicitado > preco_base_atual:
                                 # Preço MAIOR → Infla 25% e salva como preço base
                                 preco_inflado = round(preco_solicitado * 1.25, 2)
@@ -1370,12 +1407,20 @@ class ShopeeService:
                 resp_data = resp.get("response") or {}
                 error_list = resp_data.get("error_list", []) if isinstance(resp_data, dict) else []
                 
+                # Apenas tenta adicionar se o erro for porque o item NÃO está na promoção (ex: expirou)
+                should_try_add = False
                 if code == 200 and (has_error or error_list):
+                    err_msg_str = str(error_list[0].get("fail_message", "")) if error_list else str(resp.get("message", ""))
+                    if "not exist" in err_msg_str.lower() or "not in" in err_msg_str.lower() or "not found" in err_msg_str.lower():
+                        should_try_add = True
+
+                if should_try_add:
                     resp_add, code_add = self.add_discount_item(creds, discount_id, item_list, force=force)
                     if code_add == 200 and not resp_add.get("status") == "erro":
                         resp = resp_add
                         code = code_add
                     elif code_add == 400 and resp_add.get("status") == "erro":
+                        # Preserva o erro do add se falhou
                         resp = {"error": "discount.add_failed", "message": resp_add.get("mensagem")}
 
                 has_error_now = resp.get("error")
@@ -1386,12 +1431,12 @@ class ShopeeService:
                     for item in items:
                         item["sucesso"] = True
                         item["resp"] = resp
-                else:
-                    if error_list_now and not has_error_now:
-                        erro_msg = error_list_now[0].get("fail_message", "Erro ao atualizar promoção na Shopee.")
-                    else:
-                        erro_msg = self._extrair_erro(resp)
                         
+                        # Ajuste visual se foi fallback de preço base
+                        if "preço base foi alterado" in str(resp.get("mensagem", "")):
+                            item["promocao"] = None
+                else:
+                    erro_msg = self._extrair_erro(resp)
                     for item in items:
                         item["sucesso"] = False
                         item["erro_msg"] = erro_msg
@@ -1438,6 +1483,10 @@ class ShopeeService:
                                 item["sucesso"] = True
                                 item["resp"] = resp
                                 item["promocao"] = {"promotion_id": ongoing_promo_id, "promotion_type": "Discount Promotions"}
+                                
+                                # Ajuste visual se foi fallback de preço base
+                                if "preço base foi alterado" in str(resp.get("mensagem", "")):
+                                    item["promocao"] = None
                         else:
                             erro_msg = self._extrair_erro(resp)
                             for item in force_promo_updates:
@@ -2722,11 +2771,45 @@ class ShopeeService:
             error_list = resp_data.get("error_list", [])
             
             if error_list:
-                # Se há erros, vamos formatar a mensagem e falhar o processo para o item.
-                # A API retorna 200 OK mesmo quando os itens falham e vêm na error_list.
+                # Fallback: Se for erro de restrição de promoção, atualiza o preço base
+                fail_error = error_list[0].get("fail_error")
+                fail_message = error_list[0].get("fail_message", "")
+                
+                if fail_error == "discount.error_item_under_block_categories" or "prohibited from promotions" in str(fail_message).lower():
+                    price_list_base = []
+                    item_id_base = None
+                    for itm in items:
+                        item_id_base = str(itm.get("item_id"))
+                        models = itm.get("model_list", [])
+                        if models:
+                            for m in models:
+                                mid = int(m.get("model_id") or 0)
+                                p_item = {"original_price": float(m.get("model_promotion_price") or 0)}
+                                if mid > 0:
+                                    p_item["model_id"] = mid
+                                price_list_base.append(p_item)
+                        else:
+                            price_list_base.append({"original_price": float(itm.get("item_promotion_price") or 0)})
+                    
+                    if item_id_base and price_list_base:
+                        resp_base, code_base = self.atualizar_preco_base_lote(item_id_base, price_list_base, creds)
+                        if code_base == 200 and not resp_base.get("error"):
+                            return {
+                                "status": "sucesso",
+                                "mensagem": "Este produto pertence a uma categoria que não pode participar de promoções devido a Normas da Propria Shopee. O preço base foi alterado com sucesso no lugar da promoção."
+                            }, 200
+                        else:
+                            return {
+                                "status": "erro",
+                                "mensagem": f"Falha no fallback de preço base: {self._extrair_erro(resp_base)}",
+                                "shopee_response": resp_base
+                            }, 400
+
+                # Comportamento original
+                extracted_err = self._extrair_erro({"shopee_response": resp})
                 return {
                     "status": "erro",
-                    "mensagem": error_list[0].get("fail_message", "Erro ao adicionar item na promoção."),
+                    "mensagem": extracted_err if extracted_err != str({"shopee_response": resp}) else error_list[0].get("fail_message", "Erro ao adicionar item na promoção."),
                     "shopee_response": resp
                 }, 400
 
@@ -2843,6 +2926,17 @@ class ShopeeService:
         resp, code = self._shopee_request(path, creds, method="POST", json_data=payload)
 
         if code == 200:
+            resp_data = resp.get("response", {})
+            error_list = resp_data.get("error_list", [])
+            
+            if error_list:
+                extracted_err = self._extrair_erro({"shopee_response": resp})
+                return {
+                    "status": "erro",
+                    "mensagem": extracted_err if extracted_err != str({"shopee_response": resp}) else error_list[0].get("fail_message", "Erro ao atualizar item na promoção."),
+                    "shopee_response": resp
+                }, 400
+
             for itm in items:
                 iid = str(itm.get("item_id"))
                 models = itm.get("model_list", [])

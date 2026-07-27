@@ -930,25 +930,31 @@ def get_announcements():
         filters = []
 
         if search:
-            search_terms = [term.strip() for term in search.split() if term.strip()]
+            search_str = search.strip()
+            search_terms = [term.strip() for term in search_str.split() if term.strip()]
+            
             if search_terms:
                 def match_all_terms(column):
                     return and_(*[column.ilike(f"%{term}%") for term in search_terms])
                     
                 search_filters = [
                     match_all_terms(Anuncios.nome),
-                    match_all_terms(Anuncios.sku_pai),
-                    match_all_terms(Anuncios.shopee_item_id)
+                    match_all_terms(Anuncios.sku_pai)
                 ]
+                
+                # Busca exata para IDs para evitar resultados "nada a ver" por substrings
+                if search_str.isdigit():
+                    search_filters.append(Anuncios.shopee_item_id == search_str)
                 
                 # Adiciona filtros de variação se o join existir
                 if needs_products_join:
                     search_filters.extend([
                         match_all_terms(Produtos.sku),
-                        match_all_terms(Produtos.ean),
                         match_all_terms(Produtos.nome_variacao)
                     ])
-                    
+                    if search_str.isdigit():
+                        search_filters.append(Produtos.ean == search_str)
+                        
                 filters.append(or_(*search_filters))
 
         if filter_status == "locked":
@@ -1058,7 +1064,7 @@ def import_spreadsheet():
             for c in df.columns
         ]
 
-        # Mapeamento robusto de colunas (Suporta nomes amigáveis e chaves internas da Shopee)
+        # Mapeamento robusto de colunas (Suporta nomes e chaves internas da Shopee)
         sku_key = next(
             (
                 c
