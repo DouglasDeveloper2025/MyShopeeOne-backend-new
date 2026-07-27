@@ -918,7 +918,7 @@ def get_announcements():
 
         # 1. Aplicar Joins Necessários (Apenas uma vez)
         # Se houver busca ou filtros que dependam de Produtos, fazemos o join agora
-        needs_products_join = bool(search) or filter_status in ["active", "inactive", "locked"]
+        needs_products_join = bool(search) or filter_status in ["active", "inactive", "locked"] or filter_promo != "all"
         
         if needs_products_join:
             # Usamos outerjoin para busca para não excluir anúncios sem variações que batem no nome
@@ -963,15 +963,9 @@ def get_announcements():
             filters.append(or_(Produtos.situacao != "NORMAL", Produtos.estoque == None, Produtos.estoque <= 0))
             
         if filter_promo == "promo":
-            subq = db.session.query(Produtos.shopee_item_id).filter(
-                (Produtos.promotion_id != None) & (Produtos.promotion_id != "")
-            ).distinct().scalar_subquery()
-            filters.append(Anuncios.shopee_item_id.in_(subq))
+            filters.append(and_(Produtos.promotion_id != None, Produtos.promotion_id != ""))
         elif filter_promo in ["no-promo", "available"]:
-            subq = db.session.query(Produtos.shopee_item_id).filter(
-                or_(Produtos.promotion_id == None, Produtos.promotion_id == "")
-            ).distinct().scalar_subquery()
-            filters.append(Anuncios.shopee_item_id.in_(subq))
+            filters.append(or_(Produtos.promotion_id == None, Produtos.promotion_id == ""))
 
         # Aplicar todos os filtros acumulados
         if filters:

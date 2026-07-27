@@ -314,6 +314,22 @@ class ShopeeService:
                 )
                 return
 
+            # 2.1 Limpar itens excluídos/inexistentes da base local
+            try:
+                from model.shopeeModel import Anuncios, db
+                str_item_ids = [str(i) for i in item_ids]
+                if str_item_ids:
+                    deleted_count = db.session.query(Anuncios).filter(
+                        Anuncios.shopee_item_id.notin_(str_item_ids)
+                    ).delete(synchronize_session=False)
+                    db.session.commit()
+                    if deleted_count > 0:
+                        print(f"[SYNC] {deleted_count} anúncios antigos foram excluídos da base local pois não existem mais na Shopee.")
+            except Exception as e_clean:
+                print(f"[SYNC ERROR] Falha ao limpar itens excluídos: {e_clean}")
+                from model.shopeeModel import db
+                db.session.rollback()
+
             self.sync_status["total"] = len(item_ids)
             self.sync_status["mensagem"] = "Sincronizando itens em lote..."
 
@@ -1229,6 +1245,12 @@ class ShopeeService:
             for item in alvos_com_preco:
                 mid_atual = item["mid"]
                 promocao = self._get_active_promotion(item_id, mid_atual if mid_atual > 0 else None, creds)
+                
+                if not promocao:
+                    promocao_item = self._get_active_promotion(item_id, None, creds)
+                    if promocao_item:
+                        promocao = promocao_item
+                        
                 item["promocao"] = promocao
                 
                 if promocao:
@@ -1344,12 +1366,32 @@ class ShopeeService:
                 item_list.append(item_data)
                 resp, code = self.atualizar_promocao_lote(discount_id, item_list, creds)
                 
-                if code == 200 and not resp.get("error"):
+                has_error = resp.get("error")
+                resp_data = resp.get("response") or {}
+                error_list = resp_data.get("error_list", []) if isinstance(resp_data, dict) else []
+                
+                if code == 200 and (has_error or error_list):
+                    resp_add, code_add = self.add_discount_item(creds, discount_id, item_list, force=force)
+                    if code_add == 200 and not resp_add.get("status") == "erro":
+                        resp = resp_add
+                        code = code_add
+                    elif code_add == 400 and resp_add.get("status") == "erro":
+                        resp = {"error": "discount.add_failed", "message": resp_add.get("mensagem")}
+
+                has_error_now = resp.get("error")
+                resp_data_now = resp.get("response") or {}
+                error_list_now = resp_data_now.get("error_list", []) if isinstance(resp_data_now, dict) else []
+
+                if code == 200 and not has_error_now and not error_list_now:
                     for item in items:
                         item["sucesso"] = True
                         item["resp"] = resp
                 else:
-                    erro_msg = self._extrair_erro(resp)
+                    if error_list_now and not has_error_now:
+                        erro_msg = error_list_now[0].get("fail_message", "Erro ao atualizar promoção na Shopee.")
+                    else:
+                        erro_msg = self._extrair_erro(resp)
+                        
                     for item in items:
                         item["sucesso"] = False
                         item["erro_msg"] = erro_msg
