@@ -1257,54 +1257,45 @@ class ShopeeService:
 
                         # --- ESTRATÉGIA AUTOMÁTICA DE PRECIFICAÇÃO ---
                         
-                        # Verificar se a requisição veio da sincronização de combos do frontend
-                        # Combos têm preço calculado e NÃO devem receber inflação ou promoção automática
-                        is_combo_sync = (origem == "ComboSync")
-
-                        if is_combo_sync:
-                            # Combo/Kit → atualizar preço base normalmente, sem inflação ou promoção
-                            print(f"[PRICING] Item {item_id} model {mid_atual}: Sincronização de Combo detectada. Atualizando preço base diretamente.")
-                            base_updates.append(item)
-                        else:
-                            # Buscar preço base atual do banco local
-                            from model.shopeeModel import Produtos as ProdModel
+                        # Buscar preço base atual do banco local
+                        from model.shopeeModel import Produtos as ProdModel
+                        prod_local = ProdModel.query.filter_by(
+                            shopee_item_id=str(item_id),
+                            shopee_model_id=str(mid_atual)
+                        ).first()
+                        # Fallback: se não achar com model_id, tenta o primeiro do item
+                        if not prod_local and str(mid_atual) == "0":
                             prod_local = ProdModel.query.filter_by(
-                                shopee_item_id=str(item_id),
-                                shopee_model_id=str(mid_atual)
+                                shopee_item_id=str(item_id)
                             ).first()
-                            # Fallback: se não achar com model_id, tenta o primeiro do item
-                            if not prod_local and str(mid_atual) == "0":
-                                prod_local = ProdModel.query.filter_by(
-                                    shopee_item_id=str(item_id)
-                                ).first()
 
-                            preco_base_atual = prod_local.preco_base if prod_local else 0.0
-                            preco_solicitado = item["preco"]
+                        preco_base_atual = prod_local.preco_base if prod_local else 0.0
+                        preco_solicitado = item["preco"]
 
-                            if preco_base_atual > 0 and abs(preco_solicitado - preco_base_atual) > 0.01:
-                                if preco_solicitado > preco_base_atual:
-                                    # Preço MAIOR → Infla 25% e salva como preço base
-                                    preco_inflado = round(preco_solicitado * 1.25, 2)
-                                    item["preco"] = preco_inflado
-                                    item["preco_original_solicitado"] = preco_solicitado
-                                    print(f"[PRICING] Item {item_id} model {mid_atual}: Preço subiu ({preco_base_atual} -> {preco_solicitado}). Inflando 25%: {preco_inflado}")
+                        if preco_base_atual > 0 and abs(preco_solicitado - preco_base_atual) > 0.01:
+                            if preco_solicitado > preco_base_atual:
+                                # Preço MAIOR → Infla 25% e salva como preço base
+                                preco_inflado = round(preco_solicitado * 1.25, 2)
+                                item["preco"] = preco_inflado
+                                item["preco_original_solicitado"] = preco_solicitado
+                                print(f"[PRICING] Item {item_id} model {mid_atual}: Preço subiu ({preco_base_atual} -> {preco_solicitado}). Inflando 25%: {preco_inflado}")
+                                base_updates.append(item)
+                            else:
+                                if force:
+                                    # Usuário aceitou a trava. A Shopee não permite colocar em promoção um item recém-alterado.
+                                    # A única forma de alterar o preço para baixo nesse caso é alterando o PREÇO BASE diretamente.
+                                    item["preco"] = preco_solicitado
+                                    print(f"[PRICING] Item {item_id} model {mid_atual}: Preço baixou ({preco_base_atual} -> {preco_solicitado}), mas sob TRAVA (force). Atualizando PREÇO BASE.")
                                     base_updates.append(item)
                                 else:
-                                    if force:
-                                        # Usuário aceitou a trava. A Shopee não permite colocar em promoção um item recém-alterado.
-                                        # A única forma de alterar o preço para baixo nesse caso é alterando o PREÇO BASE diretamente.
-                                        item["preco"] = preco_solicitado
-                                        print(f"[PRICING] Item {item_id} model {mid_atual}: Preço baixou ({preco_base_atual} -> {preco_solicitado}), mas sob TRAVA (force). Atualizando PREÇO BASE.")
-                                        base_updates.append(item)
-                                    else:
-                                        # Preço MENOR → Manter preço base antigo, colocar em promoção automática
-                                        item["preco_promo_desejado"] = preco_solicitado
-                                        item["preco"] = preco_solicitado  # será usado como promo price
-                                        print(f"[PRICING] Item {item_id} model {mid_atual}: Preço baixou ({preco_base_atual} -> {preco_solicitado}). Encaminhando para promoção automática.")
-                                        force_promo_updates.append(item)
-                            else:
-                                # Preço igual ou sem referência → atualizar normalmente
-                                base_updates.append(item)
+                                    # Preço MENOR → Manter preço base antigo, colocar em promoção automática
+                                    item["preco_promo_desejado"] = preco_solicitado
+                                    item["preco"] = preco_solicitado  # será usado como promo price
+                                    print(f"[PRICING] Item {item_id} model {mid_atual}: Preço baixou ({preco_base_atual} -> {preco_solicitado}). Encaminhando para promoção automática.")
+                                    force_promo_updates.append(item)
+                        else:
+                            # Preço igual ou sem referência → atualizar normalmente
+                            base_updates.append(item)
 
             # --- PASSO 5: Executar atualizações em lote ---
             
@@ -1830,7 +1821,8 @@ class ShopeeService:
                     continue
 
                 if model_id:
-                    if str(p.get("model_id", 0)) == str(model_id):
+                    p_mid = str(p.get("model_id", 0))
+                    if p_mid == str(model_id) or p_mid == "0":
                         matches.append(p)
                 else:
                     matches.append(p)
