@@ -1272,7 +1272,7 @@ class ShopeeService:
                         preco_base_atual = prod_local.preco_base if prod_local else 0.0
                         preco_solicitado = item["preco"]
 
-                        if preco_base_atual > 0 and abs(preco_solicitado - preco_base_atual) > 0.01:
+                        if preco_base_atual > 0 and abs(preco_solicitado - preco_base_atual) >= 0.01:
                             if preco_solicitado > preco_base_atual:
                                 # Preço MAIOR → Infla 25% e salva como preço base
                                 preco_inflado = round(preco_solicitado * 1.25, 2)
