@@ -1333,11 +1333,11 @@ class ShopeeService:
 
                         if preco_base_atual > 0 and round(abs(preco_solicitado - preco_base_atual), 2) >= 0.01:
                             if preco_solicitado > preco_base_atual:
-                                # Preço MAIOR → Infla 25% e salva como preço base
-                                preco_inflado = round(preco_solicitado * 1.25, 2)
+                                # Preço MAIOR → Infla 33.33% (dividindo por 0.75) e salva como preço base
+                                preco_inflado = round(preco_solicitado / 0.75, 2)
                                 item["preco"] = preco_inflado
                                 item["preco_original_solicitado"] = preco_solicitado
-                                print(f"[PRICING] Item {item_id} model {mid_atual}: Preço subiu ({preco_base_atual} -> {preco_solicitado}). Inflando 25%: {preco_inflado}")
+                                print(f"[PRICING] Item {item_id} model {mid_atual}: Preço subiu ({preco_base_atual} -> {preco_solicitado}). Inflando 33.33%: {preco_inflado}")
                                 base_updates.append(item)
                             else:
                                 if force:
@@ -1588,7 +1588,7 @@ class ShopeeService:
             normais = [i for i in base_updates if i.get("sucesso") and not i.get("preco_original_solicitado")]
 
             if inflados:
-                partes_msg.append(f"{len(inflados)} Anúncio teve seu Preço alterado para + 25%")
+                partes_msg.append(f"{len(inflados)} Anúncio teve seu Preço alterado para + 33,33%")
             if promovidos:
                 partes_msg.append(f"{len(promovidos)} Anúncio teve seu Preço alterado para Promoção Automática")
             if normais:
