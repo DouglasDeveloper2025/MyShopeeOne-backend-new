@@ -157,9 +157,11 @@ class ShopeeService:
                         print(
                             "--- [403 RECOVERY] Token renovado! Repetindo requisição... ---"
                         )
+                        # Atualiza o dicionário creds para que a rotina chamadora passe a usar o token novo
+                        creds.update(new_creds)
                         # Recalcular assinatura com novo token e repetir (retry_on_403=False para evitar loop)
                         return self._shopee_request(
-                            path, new_creds, params, method, json_data
+                            path, creds, params, method, json_data
                         )
                     else:
                         print(f"--- [403 FAILURE] Falha ao renovar token: {erro} ---")
@@ -1880,7 +1882,15 @@ class ShopeeService:
 
         resp_json, code = self._shopee_request(path, creds, params=params)
         if code == 200:
-            return resp_json.get("response", {}).get("item_list", [])
+            res = resp_json.get("response", {})
+            if res is None:
+                res = {}
+            item_list = res.get("item_list", [])
+            if not item_list:
+                print(f"[Shopee API Error] _get_item_base_info_batch retornou vazio. Response: {resp_json}")
+            return item_list
+        else:
+            print(f"[Shopee API Error] HTTP {code} em _get_item_base_info_batch: {resp_json}")
         return []
 
     def _get_models(self, item_id, creds):
